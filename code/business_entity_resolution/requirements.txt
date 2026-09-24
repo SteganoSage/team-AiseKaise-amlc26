@@ -1,0 +1,24 @@
+# Core
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+
+# String matching
+rapidfuzz==3.10.1
+
+# Gradient boosting
+lightgbm==4.5.0
+
+# Approximate nearest neighbors
+faiss-cpu==1.9.0
+
+# Embeddings (MIT-licensed model)
+sentence-transformers==3.3.1
+transformers==4.46.3
+torch==2.5.1
+
+# Unicode normalization
+unidecode==1.3.8
+
+# Progress bars
+tqdm==4.67.1
