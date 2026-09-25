@@ -26,6 +26,7 @@ records when the country is missing or unknown in the target source.
 """
 
 import multiprocessing as mp
+import time
 
 import numpy as np
 import pandas as pd
@@ -351,13 +352,21 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
 
     matrices, found = {}, []
     for blocker, k in config.BLOCKING_TOP_K.items():
+        t0 = time.time()
         Q, T = tfidf_pair(blocker_texts(s1, blocker), blocker_texts(tgt, blocker), n_jobs)
+        t1 = time.time()
         matrices[blocker] = (Q, T, k)
         for s1_rows, tgt_rows in partitions:
             q, t, _, _ = sparse_topk(Q[s1_rows], T[tgt_rows], k, n_jobs)
             found.append((blocker, s1_rows[q], tgt_rows[t]))
+        if verbose:
+            # Terms kept per record = what survives BLOCKING_MAX_DF (drives search cost and recall)
+            print(f"      {blocker:>9s}: tf-idf {t1 - t0:5.0f}s, search {time.time() - t1:5.0f}s | "
+                  f"terms kept per S1 {Q.nnz / max(Q.shape[0], 1):.1f}, "
+                  f"per {source} {T.nnz / max(T.shape[0], 1):.1f}")
 
     if embeddings is not None:
+        t0 = time.time()
         e_s1 = embeddings["s1"]
         e_tgt = embeddings["tgt"][tgt["tgt_row"].to_numpy()]
         k = config.BLOCKING_TOP_K_EMBEDDING
@@ -365,6 +374,9 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
         for s1_rows, tgt_rows in partitions:
             q, t, _, _ = dense_topk(e_s1[s1_rows], e_tgt[tgt_rows], k)
             found.append(("embedding", s1_rows[q], tgt_rows[t]))
+        if verbose:
+            print(f"      embedding: search {time.time() - t0:5.0f}s")
+    t_union = time.time()
 
     # Union of all blockers: one row per (S1 row, local target row)
     n_local = len(tgt)
@@ -389,6 +401,8 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
         score = rowwise_cosine(Q, T, s1_idx, local_t)
         out[f"score_{blocker}"] = score
         out[f"rank_{blocker}"] = group_rank(s1_idx, score, cap=k + 1)
+    if verbose:
+        print(f"      union + scores for {len(out):,} pairs: {time.time() - t_union:.0f}s")
     return out
 
 

@@ -91,6 +91,12 @@ N_JOBS = os.cpu_count() or 1
 # None = all ~2.2M. Override per run with --sample-s1.
 SAMPLE_S1 = None
 
+# --mode test: train on this many random train S1 entities instead of all
+# ~2.2M (the test side always scores every test S1). 300k S1 ≈ 2M candidate
+# pairs is plenty for LightGBM and cuts the training half of a full run ~7x.
+# None = all. Override per run with --train-sample-s1.
+TRAIN_SAMPLE_S1 = None
+
 # Normalized source files are cached as parquet in <model_dir>/cache and
 # reused until the raw file or normalize.py changes.
 USE_NORMALIZE_CACHE = True
