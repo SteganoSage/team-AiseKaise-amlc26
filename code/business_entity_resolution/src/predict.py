@@ -3,7 +3,7 @@ Prediction module for entity resolution.
 
 Takes a trained LightGBM model and candidate pairs, scores each pair,
 and turns scores into final matches with a single decision rule
-(decide_matches). The same rule is used when tuning the threshold and when
+(decide). The same rule is used when tuning the threshold and when
 writing predictions, so the tuned threshold is the one that is optimal for
 the output we actually submit.
 
@@ -13,11 +13,15 @@ Decision rule:
 2. One-to-one assignment: an S2/S3 record goes to at most one S1 (the
    highest-scoring one), since S1 is deduplicated.
 3. Optional per-S1 top-N cap.
+
+Everything works on integer index arrays, so millions of pairs take seconds.
 """
 
 import numpy as np
+
 import config
 import evaluate as eval_module
+from blocking import group_rank
 
 
 def predict_scores(model, X: np.ndarray) -> np.ndarray:
@@ -31,6 +35,8 @@ def predict_scores(model, X: np.ndarray) -> np.ndarray:
     Returns:
         Array of match probabilities in [0, 1].
     """
+    if len(X) == 0:
+        return np.zeros(0)
     return model.predict(X, num_iteration=model.best_iteration)
 
 
@@ -49,45 +55,41 @@ def format_threshold(threshold) -> str:
     return f"{threshold:.3f}"
 
 
-def pair_thresholds(pairs: list, threshold):
+def pair_thresholds(is_s2: np.ndarray, threshold):
     """
     Resolve the threshold that applies to each pair.
 
     Args:
-        pairs: List of (s1_id, cand_id) tuples.
-        threshold: Float (same for all pairs), or dict {"S2": t, "S3": t}
-            keyed by the candidate ID prefix.
+        is_s2: 1 for S2 candidates, 0 for S3.
+        threshold: Float (same for all pairs), or dict {"S2": t, "S3": t}.
 
     Returns:
         The float itself, or an array with one threshold per pair.
     """
     if isinstance(threshold, dict):
-        return np.array([threshold[cand_id[:2]] for _, cand_id in pairs])
+        return np.where(is_s2 == 1, threshold["S2"], threshold["S3"])
     return threshold
 
 
-def decide_matches(scores: np.ndarray, pairs: list, threshold=None,
-                   resolve_conflicts: bool = None,
-                   max_per_s1: int = None) -> dict:
+def decide(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
+           is_s2: np.ndarray, threshold=None, resolve_conflicts: bool = None,
+           max_per_s1: int = None) -> np.ndarray:
     """
     Turn pair scores into final matches.
 
-    Pairs are processed from highest to lowest score, so conflict resolution
-    and the per-S1 cap always keep the most confident pairs.
-
     Args:
-        scores: Array of match probabilities (same order as pairs).
-        pairs: List of (s1_id, cand_id) tuples.
-        threshold: Probability cutoff, or dict {"S2": t, "S3": t}.
-            Defaults to config.MATCH_THRESHOLD.
-        resolve_conflicts: Assign each S2/S3 record to at most one S1.
-            Defaults to config.RESOLVE_CONFLICTS.
-        max_per_s1: Keep at most this many matches per S1 (None = no cap).
-            Defaults to config.MAX_MATCHES_PER_S1.
+        scores: Match probability per pair.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
+        is_s2: 1 for S2 candidates, 0 for S3.
+        threshold: Cutoff (float or {"S2": t, "S3": t}). Default config.MATCH_THRESHOLD.
+        resolve_conflicts: Assign each S2/S3 record to at most one S1 (the
+            highest-scoring). Default config.RESOLVE_CONFLICTS.
+        max_per_s1: Keep at most this many matches per S1. Default
+            config.MAX_MATCHES_PER_S1 (None = no cap).
 
     Returns:
-        Dict mapping s1_id → list of matched candidate IDs (S1 entities with
-        no match are absent).
+        Sorted indices of the pairs predicted as matches.
     """
     if threshold is None:
         threshold = config.MATCH_THRESHOLD
@@ -96,45 +98,60 @@ def decide_matches(scores: np.ndarray, pairs: list, threshold=None,
     if max_per_s1 is None:
         max_per_s1 = config.MAX_MATCHES_PER_S1
 
-    scores = np.asarray(scores)
-    keep = np.flatnonzero(scores >= pair_thresholds(pairs, threshold))
-    keep = keep[np.argsort(-scores[keep], kind="stable")]
-
-    matches = {}
-    assigned = set()
-    for i in keep:
-        s1_id, cand_id = pairs[i]
-        if resolve_conflicts and cand_id in assigned:
-            continue
-        if max_per_s1 and len(matches.get(s1_id, [])) >= max_per_s1:
-            continue
-        matches.setdefault(s1_id, []).append(cand_id)
-        assigned.add(cand_id)
-
-    return matches
+    keep = np.flatnonzero(scores >= pair_thresholds(is_s2, threshold))
+    if resolve_conflicts and len(keep):
+        order = keep[np.argsort(-scores[keep], kind="stable")]
+        _, first = np.unique(tgt_idx[order], return_index=True)
+        keep = order[first]  # best-scoring S1 for each target
+    if max_per_s1 and len(keep):
+        rank = group_rank(s1_idx[keep], scores[keep])
+        keep = keep[rank <= max_per_s1]
+    return np.sort(keep)
 
 
-def tune_threshold(scores: np.ndarray, pairs: list,
-                   ground_truth: dict, s1_ids: list,
-                   thresholds: list = None,
+def evaluate_decision(keep: np.ndarray, s1_idx: np.ndarray, labels: np.ndarray,
+                      n_true_by_row: np.ndarray, universe: np.ndarray) -> tuple:
+    """
+    Macro F0.5 / precision / recall of a set of predicted pairs.
+
+    Args:
+        keep: Indices of predicted pairs.
+        s1_idx: S1 row per pair.
+        labels: 1 for true pairs.
+        n_true_by_row: True links per S1 row (counts links blocking missed).
+        universe: S1 rows being evaluated.
+
+    Returns:
+        Tuple (macro_f05, macro_precision, macro_recall).
+    """
+    counts = eval_module.per_s1_counts(universe, n_true_by_row, s1_idx[keep], labels[keep])
+    return eval_module.macro_f05_from_counts(*counts)
+
+
+def tune_threshold(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
+                   is_s2: np.ndarray, labels: np.ndarray, n_true_by_row: np.ndarray,
+                   universe: np.ndarray, thresholds: list = None,
                    verbose: bool = True) -> tuple:
     """
     Tune the decision threshold to maximize macro F0.5.
 
     Should be given out-of-fold scores, so the threshold is not fitted on the
-    same predictions it is evaluated on. Every S1 in s1_ids is scored,
+    same predictions it is evaluated on. Every S1 in `universe` counts,
     including those with no candidates (they count as predicted-empty).
 
     Args:
-        scores: Array of match probabilities.
-        pairs: List of (s1_id, cand_id) tuples.
-        ground_truth: Dict mapping s1_id → set of true match IDs.
-        s1_ids: List of all S1 entity IDs to evaluate over.
+        scores: Match probability per pair.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
+        is_s2: 1 for S2 candidates.
+        labels: 1 for true pairs.
+        n_true_by_row: True links per S1 row.
+        universe: S1 rows to evaluate over.
         thresholds: Thresholds to try. Defaults to config.THRESHOLD_GRID.
         verbose: Whether to print progress.
 
     Returns:
-        Tuple of (best_threshold, best_f05_score). best_threshold is a dict
+        Tuple (best_threshold, best_f05). best_threshold is a dict
         {"S2": t, "S3": t} when config.PER_SOURCE_THRESHOLD is on.
     """
     if thresholds is None:
@@ -142,16 +159,14 @@ def tune_threshold(scores: np.ndarray, pairs: list,
         thresholds = np.round(np.arange(start, stop, step), 4)
 
     # Pairs below the lowest threshold can never be predicted: drop them once
-    scores = np.asarray(scores)
-    idx = np.flatnonzero(scores >= min(thresholds))
-    sub_scores = scores[idx]
-    sub_pairs = [pairs[i] for i in idx]
-    gt = {s1_id: ground_truth.get(s1_id, set()) for s1_id in s1_ids}
+    sub = np.flatnonzero(scores >= min(thresholds))
+    sub_scores, sub_s1, sub_tgt = scores[sub], s1_idx[sub], tgt_idx[sub]
+    sub_s2, sub_labels = is_s2[sub], labels[sub]
 
     def score(threshold) -> tuple:
         """Macro F0.5, precision, recall of the decision rule at `threshold`."""
-        matches = decide_matches(sub_scores, sub_pairs, threshold=threshold)
-        return eval_module.macro_f05_with_details(matches, gt)
+        keep = decide(sub_scores, sub_s1, sub_tgt, sub_s2, threshold)
+        return evaluate_decision(keep, sub_s1, sub_labels, n_true_by_row, universe)
 
     rows = [(float(t), *score(float(t))) for t in thresholds]
     best_threshold, best_f05, _, _ = max(rows, key=lambda r: r[1])

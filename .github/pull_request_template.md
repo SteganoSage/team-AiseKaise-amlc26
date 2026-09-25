@@ -2,17 +2,21 @@
 <!-- One idea per PR. What did you change and why? -->
 
 ## Local validation — `run_pipeline.py --mode validate`
-<!-- Run on main and on this branch with the same data. Numbers are in models/run_info_validate.json. -->
+<!-- Run on main and on this branch with the same data and the same --sample-s1.
+     Numbers are in models/run_info_validate.json. Both F0.5 and candidates per S1 count for ranking. -->
+
+`--sample-s1` used: ____
 
 | | main | this branch |
 |---|---|---|
 | Holdout macro F0.5 | | |
 | Holdout precision / recall | | |
 | OOF F0.5 | | |
-| Holdout blocking recall | | |
-| Candidates per S1 (mean) | | |
+| Candidates per S1 — stage 2 (= candidate_pairs) | | |
+| Candidate recall — stage 2 | | |
+| Candidates per S1 / recall — stage 1 | | |
 | Threshold | | |
-| Runtime | | |
+| Runtime / peak RAM | | |
 
 ## Checklist
 - [ ] Branched from latest `main` and merged `main` back in before the final run

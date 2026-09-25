@@ -22,50 +22,57 @@ from sklearn.model_selection import GroupKFold
 import config
 
 
-def create_labels(pairs: list, ground_truth: dict) -> np.ndarray:
+def pair_keys(s1_idx: np.ndarray, tgt_idx: np.ndarray, n_targets: int) -> np.ndarray:
     """
-    Create binary labels for candidate pairs.
-
-    A pair (S1, candidate) is positive (1) if the candidate appears in the
-    ground truth matched_entity_ids for that S1 entity.
+    Encode (S1 row, target row) pairs as single int64 keys.
 
     Args:
-        pairs: List of (s1_id, cand_id) tuples.
-        ground_truth: Dict mapping s1_id → set of true match IDs.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
+        n_targets: Number of target rows (key base).
 
     Returns:
-        numpy array of binary labels (0 or 1), same length as pairs.
+        int64 key per pair.
     """
-    labels = np.zeros(len(pairs), dtype=np.int32)
-    for i, (s1_id, cand_id) in enumerate(pairs):
-        true_matches = ground_truth.get(s1_id, set())
-        if cand_id in true_matches:
-            labels[i] = 1
-    return labels
+    return s1_idx.astype(np.int64) * n_targets + tgt_idx.astype(np.int64)
 
 
-def holdout_split_s1(s1_ids: list, val_ratio: float = None,
-                     seed: int = None) -> tuple:
+def make_labels(s1_idx: np.ndarray, tgt_idx: np.ndarray, true_keys: np.ndarray,
+                n_targets: int) -> np.ndarray:
     """
-    Split S1 entity IDs into a development set and an untouched holdout set.
+    Binary labels for candidate pairs: 1 if the pair is a ground-truth link.
 
     Args:
-        s1_ids: List of S1 entity IDs.
-        val_ratio: Fraction of S1 entities held out. Defaults to config.
-        seed: Random seed. Defaults to config.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
+        true_keys: Sorted pair_keys of all ground-truth links.
+        n_targets: Number of target rows.
 
     Returns:
-        Tuple of (dev_ids, holdout_ids) as sets.
+        int8 label per pair.
+    """
+    return np.isin(pair_keys(s1_idx, tgt_idx, n_targets), true_keys).astype(np.int8)
+
+
+def holdout_split_rows(n_rows: int, val_ratio: float = None, seed: int = None) -> tuple:
+    """
+    Split S1 rows into a development set and an untouched holdout set.
+
+    Args:
+        n_rows: Number of S1 rows.
+        val_ratio: Fraction held out. Defaults to config.VAL_SPLIT_RATIO.
+        seed: Random seed. Defaults to config.RANDOM_SEED.
+
+    Returns:
+        Tuple (dev_rows, holdout_rows) of sorted integer arrays.
     """
     if val_ratio is None:
         val_ratio = config.VAL_SPLIT_RATIO
     if seed is None:
         seed = config.RANDOM_SEED
-
-    ids = np.array(sorted(s1_ids))
-    np.random.default_rng(seed).shuffle(ids)
-    split_idx = int(len(ids) * (1 - val_ratio))
-    return set(ids[:split_idx].tolist()), set(ids[split_idx:].tolist())
+    rows = np.random.default_rng(seed).permutation(n_rows)
+    split_idx = int(n_rows * (1 - val_ratio))
+    return np.sort(rows[:split_idx]), np.sort(rows[split_idx:])
 
 
 def cross_validate_oof(X: np.ndarray, y: np.ndarray, groups: np.ndarray,
@@ -80,7 +87,7 @@ def cross_validate_oof(X: np.ndarray, y: np.ndarray, groups: np.ndarray,
     Args:
         X: Feature matrix for all pairs.
         y: Binary labels.
-        groups: S1 entity ID of each pair (fold grouping key).
+        groups: S1 row of each pair (fold grouping key).
         feature_names: List of feature names.
         n_folds: Number of folds. Defaults to config.CV_FOLDS.
         verbose: Whether to print per-fold results.

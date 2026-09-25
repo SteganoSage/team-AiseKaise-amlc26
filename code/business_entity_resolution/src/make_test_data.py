@@ -7,10 +7,14 @@ for US and India (train) and France (test), including noise patterns
 the pipeline must handle: abbreviations, typos, missing fields, multiple
 matches per S1, and singletons.
 
-Run from the repo root:
+Writes to <repo>/dataset_fake/ (NOT dataset/, which holds the real data)
+and refuses to overwrite existing files. Run from the repo root:
     python code/business_entity_resolution/src/make_test_data.py
+    python code/business_entity_resolution/src/run_pipeline.py --mode validate \
+        --data-dir dataset_fake --model-dir dataset_fake/models --output-dir dataset_fake/output
 """
 
+import argparse
 import os
 import sys
 
@@ -20,7 +24,9 @@ import config
 
 
 def write_tsv(path, header, rows):
-    """Write a TSV file from a list of row tuples."""
+    """Write a TSV file from a list of row tuples (never overwrites a file)."""
+    if os.path.exists(path):
+        sys.exit(f"  ✗ {path} already exists — refusing to overwrite (real data?).")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\t".join(header) + "\n")
@@ -30,6 +36,12 @@ def write_tsv(path, header, rows):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate a tiny synthetic dataset")
+    parser.add_argument("--out-dir", default=os.path.join(config.REPO_ROOT, "dataset_fake"),
+                        help="Where to write train/ and test/ (default: <repo>/dataset_fake)")
+    args = parser.parse_args()
+    config.set_paths(args.out_dir)
+
     print("Generating synthetic test dataset...\n")
 
     # ── Train Source 1 (S1): 20 records ──
