@@ -7,7 +7,7 @@
 Given business records from 3 independent sources (S1, S2, S3), predict which S2/S3
 records refer to the same real-world business as each S1 entity. Matching is based on
 noisy business names and addresses — there are no shared IDs across sources.
-
+ 
 - **Train countries:** US, India
 - **Test adds:** France (unseen during training)
 - **Metric:** Macro-averaged F0.5 per S1 entity (precision-heavy)
