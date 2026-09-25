@@ -2,8 +2,8 @@
 End-to-end pipeline for Business Entity Resolution.
 
 Usage (from the repo root):
-    python code/business_entity_resolution/src/run_pipeline.py --mode validate
-    python code/business_entity_resolution/src/run_pipeline.py --mode loco
+    python code/business_entity_resolution/src/run_pipeline.py --mode validate --sample-s1 200000
+    python code/business_entity_resolution/src/run_pipeline.py --mode loco --sample-s1 200000
     python code/business_entity_resolution/src/run_pipeline.py --mode test
 
     # Kaggle: dataset is read-only under /kaggle/input, outputs go to /kaggle/working
@@ -11,31 +11,45 @@ Usage (from the repo root):
         --data-dir /kaggle/input/<dataset>/dataset \
         --output-dir /kaggle/working/output --model-dir /kaggle/working/models
 
-Modes:
-- validate: Hold out 20% of train S1 entities. Fit on the rest (group K-fold
-            out-of-fold scores pick the threshold and boosting rounds), then
-            report blocking recall and macro F0.5 on the untouched holdout,
-            per country, and dump the holdout errors.
-- loco:     Leave one country out: for each train country, fit on the other
-            countries and evaluate on it. Our stand-in for the unseen test
-            country (France).
-- test:     Fit the same way on all train data, predict on the test set,
-            write output/*.tsv and run utils/validate_submission.py.
+Pipeline (the real data is ~12M records per split, so every stage is built
+for scale — compact string columns, sparse/parallel blocking, index arrays):
 
-Blocking and features always run once over ALL S1 records of a split (the
-rank features compare each pair with its competitors); modes then select
-pairs by S1 entity. Labels are never used before fitting, so this is not
-leakage — at test time all test S1 records are also scored together.
+    load + normalize (cached)
+      → stage 1 blocking      broad, high-recall candidates (blocking.py)
+      → stage 2 pruning       light LightGBM keeps the best few per S1 (prune.py)
+                              = candidate_pairs.tsv (what the final model scores)
+      → stage 3 matching      full features + LightGBM + tuned threshold
+      → matching_results.tsv  + organizers' validator
+
+Modes:
+- validate: Hold out 20% of (optionally sampled) train S1 entities. Fit on
+            the rest (group K-fold OOF scores pick the threshold and boosting
+            rounds) and report candidate-set size, recall and macro F0.5 on
+            the untouched holdout, per country, plus an error dump.
+- loco:     Leave one country out: fit on the other countries, evaluate on
+            it. Our stand-in for the unseen test country (France).
+- test:     Fit on all train data, predict the test set, write output/*.tsv
+            and run utils/validate_submission.py.
+
+Blocking and features run once over all S1 records of a split (rank features
+compare each pair with its competitors); modes then select pairs by S1.
+Labels are never used before fitting, and the pruner is out-of-fold on
+train, so this is not leakage — at test time all test S1s are also scored
+together.
 """
 
 import argparse
+import gc
+import hashlib
 import json
 import os
+import pickle
 import subprocess
 import sys
 import time
 
 import numpy as np
+import pandas as pd
 
 # Ensure the src directory is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +58,7 @@ import config
 import io_utils
 import normalize
 import blocking
+import prune
 import features
 import train
 import predict
@@ -54,323 +69,374 @@ import evaluate
 # Loading
 # ──────────────────────────────────────────────────────────────────────
 
-def load_and_normalize(source1_path: str, source2_path: str,
-                       source3_path: str, verbose: bool = True) -> tuple:
+def _cache_path(path: str) -> str:
     """
-    Load source TSVs and normalize all records.
+    Parquet cache location for the normalized version of a source file.
+
+    The key changes whenever the raw file or normalize.py changes.
 
     Args:
-        source1_path: Path to source 1 TSV.
-        source2_path: Path to source 2 TSV.
-        source3_path: Path to source 3 TSV.
+        path: Raw TSV path.
+
+    Returns:
+        Cache file path under <model_dir>/cache.
+    """
+    stat = os.stat(path)
+    with open(normalize.__file__, "rb") as f:
+        code = f.read()
+    key = hashlib.sha1(
+        f"{os.path.abspath(path)}|{stat.st_size}|{stat.st_mtime_ns}".encode() + code
+    ).hexdigest()[:12]
+    return os.path.join(config.MODEL_DIR, "cache",
+                        f"{os.path.basename(path)}.{key}.parquet")
+
+
+def load_source(path: str, verbose: bool = True) -> pd.DataFrame:
+    """
+    Read and normalize one source file (cached as parquet).
+
+    Args:
+        path: Raw TSV path.
         verbose: Whether to print progress.
 
     Returns:
-        Tuple of (s1_records, s2_records, s3_records) as lists of dicts.
+        Normalized frame with compact string columns.
     """
+    cache = _cache_path(path)
+    if config.USE_NORMALIZE_CACHE and os.path.exists(cache):
+        df = pd.read_parquet(cache, dtype_backend="pyarrow")
+        df = df.astype({c: io_utils.STRING_DTYPE for c in df.columns})
+        if verbose:
+            print(f"  {os.path.basename(path)}: {len(df):,} records (normalized, from cache)")
+        return df
+
+    t0 = time.time()
+    df = normalize.normalize_frame(io_utils.read_source_tsv(path), n_jobs=config.N_JOBS)
     if verbose:
-        print("Loading and normalizing data...")
-
-    df1 = io_utils.read_source_tsv(source1_path)
-    df2 = io_utils.read_source_tsv(source2_path)
-    df3 = io_utils.read_source_tsv(source3_path)
-
-    if verbose:
-        print(f"  S1: {len(df1)} records, S2: {len(df2)} records, S3: {len(df3)} records")
-        for name, df in [("S1", df1), ("S2", df2), ("S3", df3)]:
-            counts = df["country"].value_counts().head(5).to_dict()
-            print(f"  {name} countries: {counts}")
-
-    s1_records = normalize.normalize_dataframe(df1)
-    s2_records = normalize.normalize_dataframe(df2)
-    s3_records = normalize.normalize_dataframe(df3)
-
-    if verbose:
-        print("  ✓ Normalization complete")
-
-    return s1_records, s2_records, s3_records
+        print(f"  {os.path.basename(path)}: {len(df):,} records "
+              f"(normalized in {time.time() - t0:.0f}s)")
+    if config.USE_NORMALIZE_CACHE:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        df.to_parquet(cache, index=False)
+    return df
 
 
-def load_ground_truth(path: str, s1_ids: list = None) -> dict:
-    """
-    Load and parse the ground truth file.
-
-    Args:
-        path: Path to ground truth TSV.
-        s1_ids: All S1 entity IDs. Any S1 missing from the file gets an empty
-            set (a singleton), so every S1 entity is scored.
-
-    Returns:
-        Dict mapping s1_id → set of true match IDs.
-    """
-    df = io_utils.read_ground_truth(path)
-    gt = {s1_id: set() for s1_id in (s1_ids or [])}
-    for s1_id, matched in zip(df["source1_entity_id"], df["matched_entity_ids"]):
-        gt[s1_id] = set(io_utils.parse_id_list(matched))
-    return gt
-
-
-def records_to_map(records: list) -> dict:
-    """
-    Convert a list of record dicts to a dict keyed by entity_id.
-
-    Args:
-        records: List of normalized record dicts.
-
-    Returns:
-        Dict mapping entity_id → record dict.
-    """
-    return {rec["entity_id"]: rec for rec in records}
-
-
-def load_split(split: str, verbose: bool = True) -> dict:
+def load_split(split: str, sample_s1: int = None, verbose: bool = True) -> dict:
     """
     Load, normalize and (optionally) embed one split.
 
     Args:
         split: "train" or "test".
+        sample_s1: Use only this many randomly chosen S1 records (all S2/S3
+            records are kept, so blocking difficulty stays realistic).
         verbose: Whether to print progress.
 
     Returns:
-        Dict with s1 / s2 / s3 record lists, s1_ids, s1_map, target_map
-        (S2 + S3 by ID), embeddings (or None), and ground_truth (train only).
+        Dict with:
+        - s1: S1 frame (row = S1 index), tgt: S2 + S3 frame (row = target index)
+        - emb: embeddings or None
+        - train only: true_keys (sorted pair keys of true links),
+          n_true_by_row (true links per S1 row), links (s1_row, tgt_row) arrays
     """
     if split == "train":
         paths = (config.TRAIN_SOURCE1, config.TRAIN_SOURCE2, config.TRAIN_SOURCE3)
     else:
         paths = (config.TEST_SOURCE1, config.TEST_SOURCE2, config.TEST_SOURCE3)
-    s1, s2, s3 = load_and_normalize(*paths, verbose=verbose)
+    print(f"\nLoading {split} split...")
+    s1 = load_source(paths[0], verbose)
+    s2 = load_source(paths[1], verbose)
+    s3 = load_source(paths[2], verbose)
+    tgt = pd.concat([s2.assign(source="S2"), s3.assign(source="S3")], ignore_index=True)
+    del s2, s3
+    gc.collect()
 
-    data = {
-        "s1": s1, "s2": s2, "s3": s3,
-        "s1_ids": [r["entity_id"] for r in s1],
-        "s1_map": records_to_map(s1),
-        "target_map": {**records_to_map(s2), **records_to_map(s3)},
-        "embeddings": None,
-    }
+    if sample_s1 and sample_s1 < len(s1):
+        rows = np.sort(np.random.default_rng(config.RANDOM_SEED)
+                       .choice(len(s1), size=sample_s1, replace=False))
+        s1 = s1.iloc[rows].reset_index(drop=True)
+        print(f"  Sampled {len(s1):,} S1 records (all {len(tgt):,} S2/S3 records kept)")
+
+    if verbose:
+        for name, frame in (("S1", s1), ("S2+S3", tgt)):
+            counts = frame["country"].value_counts().head(6).to_dict()
+            print(f"  {name} countries: {counts}")
+
+    data = {"s1": s1, "tgt": tgt, "emb": None}
+    if split == "train":
+        links = io_utils.ground_truth_links(io_utils.read_ground_truth(config.TRAIN_GROUND_TRUTH))
+        s1_row = pd.Index(s1["entity_id"]).get_indexer(links["s1_id"])
+        tgt_row = pd.Index(tgt["entity_id"]).get_indexer(links["cand_id"])
+        ours = s1_row >= 0
+        s1_row, tgt_row = s1_row[ours], tgt_row[ours]
+        data["links"] = (s1_row, tgt_row)
+        data["n_true_by_row"] = np.bincount(s1_row, minlength=len(s1))
+        found = tgt_row >= 0
+        data["true_keys"] = np.unique(train.pair_keys(s1_row[found], tgt_row[found], len(tgt)))
+        singletons = (data["n_true_by_row"] == 0).mean()
+        print(f"  Ground truth: {len(s1_row):,} links for {len(s1):,} S1 "
+              f"({singletons:.1%} singletons); {int((~found).sum())} linked IDs missing "
+              f"from S2/S3 files")
+
     if config.USE_EMBEDDINGS:
         import embeddings
-        data["embeddings"] = embeddings.embed_records([s1, s2, s3], verbose=verbose)
-    if split == "train":
-        data["ground_truth"] = load_ground_truth(config.TRAIN_GROUND_TRUTH, data["s1_ids"])
-        gt = data["ground_truth"]
-        n_with_matches = sum(1 for v in gt.values() if v)
-        print(f"  Ground truth: {len(gt)} S1 entities ({n_with_matches} with matches, "
-              f"{len(gt) - n_with_matches} singletons)")
+        data["emb"] = {"s1": embeddings.embed_frame(s1, verbose),
+                       "tgt": embeddings.embed_frame(tgt, verbose)}
     return data
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Pipeline stages
+# Stages
 # ──────────────────────────────────────────────────────────────────────
 
-def build_pairs(data: dict, verbose: bool = True) -> dict:
+def build_candidates(data: dict, pruner=None, fit_final_pruner: bool = False,
+                     verbose: bool = True) -> dict:
     """
-    Blocking + pair features for every S1 record of a split, in one pass.
+    Stage 1 (blocking) + stage 2 (pruning) for one split.
 
     Args:
         data: Output of load_split.
+        pruner: Trained pruner to apply (test). If None, labels are required
+            and the pruner is fitted out-of-fold (train).
+        fit_final_pruner: Also fit a pruner on all train pairs (to apply to test).
         verbose: Whether to print progress.
 
     Returns:
-        Dict with candidates, sources, X, pairs, feature_names, and
-        pair_s1 (numpy array of the S1 ID of each pair, for selection).
+        Dict with pairs (pruned; with pruner_prob), labels (train) and
+        pruner, plus stage-1/2 size and recall numbers.
     """
-    candidates, sources = blocking.generate_candidates(
-        data["s1"], data["s2"], data["s3"],
-        embeddings=data["embeddings"], verbose=verbose,
-    )
-    X, pairs, feature_names = features.build_feature_matrix(
-        data["s1_map"], data["target_map"], candidates,
-        sources=sources, embeddings=data["embeddings"], verbose=verbose,
-    )
-    return {
-        "candidates": candidates,
-        "sources": sources,
-        "X": X,
-        "pairs": pairs,
-        "feature_names": feature_names,
-        "pair_s1": np.array([p[0] for p in pairs]),
-    }
+    s1, tgt = data["s1"], data["tgt"]
+    labelled = "true_keys" in data
+    t0 = time.time()
+    block_emb = None
+    if data["emb"] is not None:
+        block_emb = {"s1": data["emb"]["s1"]["full"], "tgt": data["emb"]["tgt"]["full"]}
+
+    print("\n[stage 1] Blocking...")
+    pairs = blocking.generate_candidates(s1, tgt, embeddings=block_emb, verbose=verbose)
+    out = {"stage1": blocking.print_candidate_stats(pairs, len(s1), len(tgt), "Stage 1 (blocking)")}
+    labels = None
+    if labelled:
+        labels = train.make_labels(pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy(),
+                                   data["true_keys"], len(tgt))
+        out["stage1"]["recall"] = blocking.report_recall(
+            pairs, labels, int(data["n_true_by_row"].sum()), "Stage 1 (blocking)")
+    print(f"  stage 1 took {time.time() - t0:.0f}s")
+
+    print("\n[stage 2] Pruning...")
+    t0 = time.time()
+    Xp, pruner_names = prune.pruner_features(pairs, s1, tgt, verbose)
+    groups = pairs["s1_idx"].to_numpy()
+    if pruner is None:
+        prob = prune.oof_pruner_scores(Xp, labels, groups, pruner_names, verbose)
+        if fit_final_pruner:
+            pruner = prune.fit_pruner(Xp, labels, groups, pruner_names)
+    else:
+        prob = pruner.predict(Xp).astype(np.float32)
+    del Xp
+    gc.collect()
+
+    keep = prune.select(pairs, prob)
+    pairs = pairs.iloc[keep].reset_index(drop=True)
+    pairs["pruner_prob"] = prob[keep]
+    out["stage2"] = blocking.print_candidate_stats(
+        pairs, len(s1), len(tgt), "Stage 2 (pruned) = candidate_pairs.tsv")
+    if labelled:
+        labels = labels[keep]
+        out["stage2"]["recall"] = blocking.report_recall(
+            pairs, labels, int(data["n_true_by_row"].sum()), "Stage 2 (pruned)")
+    print(f"  stage 2 took {time.time() - t0:.0f}s")
+
+    out.update(pairs=pairs, labels=labels, pruner=pruner)
+    return out
 
 
-def select_pairs(built: dict, s1_ids: set) -> tuple:
+def fit_matcher(X: np.ndarray, pairs: pd.DataFrame, labels: np.ndarray,
+                n_true_by_row: np.ndarray, universe: np.ndarray,
+                feature_names: list, verbose: bool = True) -> dict:
     """
-    Select the rows of the feature matrix that belong to the given S1 entities.
-
-    Args:
-        built: Output of build_pairs.
-        s1_ids: Set of S1 entity IDs to keep.
-
-    Returns:
-        Tuple of (X subset, pairs subset).
-    """
-    mask = np.isin(built["pair_s1"], list(s1_ids))
-    idx = np.flatnonzero(mask)
-    return built["X"][idx], [built["pairs"][i] for i in idx]
-
-
-def fit_matcher(X: np.ndarray, pairs: list, feature_names: list,
-                ground_truth: dict, s1_ids: list, verbose: bool = True) -> dict:
-    """
-    Fit the matcher on labelled pairs.
+    Stage 3: fit the final matcher on labelled candidate pairs.
 
     Group K-fold OOF scores → tune threshold on OOF (with the same decision
     rule used for final predictions) → train the final LightGBM on all pairs
     with the mean best iteration from the folds.
 
     Args:
-        X: Feature matrix of the labelled pairs.
-        pairs: List of (s1_id, cand_id), same order as X.
+        X: Stage-3 feature matrix of the pairs.
+        pairs: Pairs (s1_idx, tgt_idx, is_s2), same order as X.
+        labels: 1 for true pairs.
+        n_true_by_row: True links per S1 row (counts links blocking missed).
+        universe: S1 rows these pairs come from (every one counts in F0.5).
         feature_names: Feature names.
-        ground_truth: Dict s1_id → set of true match IDs, for every S1 in s1_ids.
-        s1_ids: All labelled S1 entity IDs (including ones with no candidates).
         verbose: Whether to print progress.
 
     Returns:
-        Dict with model, threshold, num_boost_round, oof_f05, n_pairs,
-        n_positives.
+        Dict with model, threshold, num_boost_round, oof_f05.
     """
-    y = train.create_labels(pairs, ground_truth)
-    if verbose:
-        print(f"\n  Pairs: {len(y):,}, positives: {int(y.sum())} "
-              f"({100 * y.mean():.2f}%)")
-
-    print(f"\n[fit] {config.CV_FOLDS}-fold group CV (by S1 entity)...")
-    groups = np.array([p[0] for p in pairs])
-    oof, best_iters = train.cross_validate_oof(
-        X, y, groups, feature_names=feature_names, verbose=verbose
-    )
+    s1_idx, tgt_idx = pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy()
+    is_s2 = pairs["is_s2"].to_numpy()
+    print(f"\n[stage 3] {config.CV_FOLDS}-fold group CV on {len(labels):,} pairs "
+          f"({int(labels.sum()):,} positives)...")
+    oof, best_iters = train.cross_validate_oof(X, labels, s1_idx, feature_names, verbose=verbose)
     threshold, oof_f05 = predict.tune_threshold(
-        oof, pairs, ground_truth, s1_ids, verbose=verbose
-    )
+        oof, s1_idx, tgt_idx, is_s2, labels, n_true_by_row, universe, verbose=verbose)
 
     num_boost_round = max(int(round(np.mean(best_iters))), 1)
-    print(f"\n[fit] Final LightGBM on all pairs ({num_boost_round} rounds)...")
-    model = train.train_model(
-        X, y, feature_names=feature_names, num_boost_round=num_boost_round,
-        verbose=verbose,
-    )
-
-    return {
-        "model": model,
-        "threshold": threshold,
-        "num_boost_round": num_boost_round,
-        "oof_f05": oof_f05,
-        "n_pairs": len(y),
-        "n_positives": int(y.sum()),
-    }
+    print(f"\n[stage 3] Final LightGBM on all pairs ({num_boost_round} rounds)...")
+    model = train.train_model(X, labels, feature_names=feature_names,
+                              num_boost_round=num_boost_round, verbose=verbose)
+    return {"model": model, "threshold": threshold,
+            "num_boost_round": num_boost_round, "oof_f05": oof_f05}
 
 
-def predict_matches(fitted: dict, X: np.ndarray, pairs: list,
-                    s1_ids: list) -> tuple:
+def stage3_features(data: dict, pairs: pd.DataFrame, verbose: bool = True) -> tuple:
     """
-    Score pairs with a fitted matcher and apply its decision rule.
+    Stage-3 feature matrix for a split's pruned candidate pairs.
 
     Args:
-        fitted: Output of fit_matcher.
-        X: Feature matrix.
-        pairs: List of (s1_id, cand_id), same order as X.
-        s1_ids: Every S1 ID that needs a prediction (empty list if no match).
+        data: Output of load_split.
+        pairs: Pruned candidate pairs.
+        verbose: Whether to print progress.
 
     Returns:
-        Tuple of (predictions dict s1_id → list of IDs, scores array).
+        Tuple (X, feature_names).
     """
-    scores = predict.predict_scores(fitted["model"], X) if len(pairs) else np.zeros(0)
-    matches = predict.decide_matches(scores, pairs, fitted["threshold"])
-    return {s1_id: matches.get(s1_id, []) for s1_id in s1_ids}, scores
+    t0 = time.time()
+    X, names = features.build_feature_matrix(pairs, data["s1"], data["tgt"],
+                                             embeddings=data["emb"], verbose=verbose)
+    print(f"  stage-3 features took {time.time() - t0:.0f}s")
+    return X, names
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Reports
 # ──────────────────────────────────────────────────────────────────────
 
-def report_by_country(predictions: dict, ground_truth: dict, s1_map: dict) -> dict:
+def evaluate_rows(pairs: pd.DataFrame, labels: np.ndarray, keep: np.ndarray,
+                  n_true_by_row: np.ndarray, rows: np.ndarray) -> dict:
     """
-    Print macro F0.5 / precision / recall per S1 country.
+    Macro F0.5 / P / R, candidate recall and all-empty baseline for some S1 rows.
 
     Args:
-        predictions: Dict s1_id → predicted IDs.
-        ground_truth: Dict s1_id → true IDs (the S1s to report on).
-        s1_map: Dict s1_id → normalized S1 record.
+        pairs: Candidate pairs of these rows.
+        labels: Labels of those pairs.
+        keep: Indices (into pairs) predicted as matches.
+        n_true_by_row: True links per S1 row.
+        rows: S1 rows to evaluate.
 
     Returns:
-        Dict country → {"n": ..., "f05": ..., "precision": ..., "recall": ...}.
+        Dict of metrics.
     """
-    by_country = {}
-    for s1_id in ground_truth:
-        by_country.setdefault(s1_map[s1_id].get("country_norm", ""), []).append(s1_id)
+    f05, p, r = predict.evaluate_decision(keep, pairs["s1_idx"].to_numpy(), labels,
+                                          n_true_by_row, rows)
+    empty = evaluate.macro_f05_from_counts(n_true_by_row[rows], np.zeros(len(rows)),
+                                           np.zeros(len(rows)))[0]
+    return {"n_s1": int(len(rows)), "f05": f05, "precision": p, "recall": r,
+            "all_empty_f05": empty,
+            "candidate_recall": float(labels.sum() / max(n_true_by_row[rows].sum(), 1)),
+            "candidates_per_s1": float(len(pairs) / max(len(rows), 1))}
 
+
+def report_by_country(data: dict, pairs: pd.DataFrame, labels: np.ndarray,
+                      keep: np.ndarray, rows: np.ndarray) -> dict:
+    """
+    Print holdout metrics per S1 country.
+
+    Args:
+        data: Output of load_split (train).
+        pairs: Holdout candidate pairs.
+        labels: Their labels.
+        keep: Indices predicted as matches.
+        rows: Holdout S1 rows.
+
+    Returns:
+        Dict country → metrics.
+    """
+    country = data["s1"]["country_norm"].to_numpy(dtype=object)
+    pair_country = country[pairs["s1_idx"].to_numpy()]
+    kept_mask = np.zeros(len(pairs), dtype=bool)
+    kept_mask[keep] = True
     report = {}
-    print(f"\n  {'country':>12s}  {'S1':>6s}  {'singletons':>10s}  {'F0.5':>7s}  "
-          f"{'P':>7s}  {'R':>7s}")
-    for country, ids in sorted(by_country.items()):
-        gt = {s: ground_truth[s] for s in ids}
-        f05, p, r = evaluate.macro_f05_with_details(predictions, gt)
-        singletons = sum(1 for s in ids if not gt[s]) / len(ids)
-        report[country] = {"n": len(ids), "f05": f05, "precision": p, "recall": r}
-        print(f"  {country or '(none)':>12s}  {len(ids):>6d}  {singletons:>10.1%}  "
-              f"{f05:>7.4f}  {p:>7.4f}  {r:>7.4f}")
+    print(f"\n  {'country':>10s}  {'S1':>8s}  {'singletons':>10s}  {'F0.5':>7s}  "
+          f"{'P':>7s}  {'R':>7s}  {'cands/S1':>8s}  {'cand recall':>11s}")
+    for c in sorted(set(country[rows])):
+        c_rows = rows[country[rows] == c]
+        sel = np.flatnonzero(pair_country == c)
+        m = evaluate_rows(pairs.iloc[sel], labels[sel], np.flatnonzero(kept_mask[sel]),
+                          data["n_true_by_row"], c_rows)
+        report[c] = m
+        singles = (data["n_true_by_row"][c_rows] == 0).mean()
+        print(f"  {c or '(none)':>10s}  {m['n_s1']:>8,d}  {singles:>10.1%}  {m['f05']:>7.4f}  "
+              f"{m['precision']:>7.4f}  {m['recall']:>7.4f}  {m['candidates_per_s1']:>8.2f}  "
+              f"{m['candidate_recall']:>11.4f}")
     return report
 
 
-def write_error_dump(path: str, predictions: dict, ground_truth: dict,
-                     candidates: dict, pairs: list, scores: np.ndarray,
-                     s1_map: dict, target_map: dict) -> int:
+def write_error_dump(path: str, data: dict, pairs: pd.DataFrame, labels: np.ndarray,
+                     scores: np.ndarray, keep: np.ndarray, rows: np.ndarray) -> int:
     """
-    Write every wrong decision on the holdout, with names and addresses.
+    Write every wrong decision for the given S1 rows, with names and addresses.
 
     Error types:
     - FP: predicted but not a true match
-    - FN_scored: true match that was a candidate but scored below threshold
-      (or lost to another S1 in conflict resolution)
-    - FN_not_shortlisted: true match that blocking never proposed
+    - FN_scored: true match that was a candidate but was not predicted
+    - FN_not_candidate: true match that never made it into candidate_pairs
+      (missed by blocking or dropped by pruning)
 
     Args:
         path: Output TSV path.
-        predictions: Dict s1_id → predicted IDs.
-        ground_truth: Dict s1_id → true IDs.
-        candidates: Dict s1_id → candidate IDs.
-        pairs: Scored pairs (s1_id, cand_id).
-        scores: Score of each pair.
-        s1_map: Dict S1 ID → record.
-        target_map: Dict S2/S3 ID → record.
+        data: Output of load_split (train).
+        pairs: Candidate pairs of these rows.
+        labels: Their labels.
+        scores: Their match probabilities.
+        keep: Indices predicted as matches.
+        rows: S1 rows the dump covers.
 
     Returns:
         Number of error rows written.
     """
-    score_of = {pair: float(s) for pair, s in zip(pairs, scores)}
-    rows = []
-    for s1_id, true_ids in ground_truth.items():
-        pred = set(predictions.get(s1_id, []))
-        cands = set(candidates.get(s1_id, []))
-        errors = [(c, "FP") for c in sorted(pred - true_ids)]
-        errors += [(c, "FN_scored" if c in cands else "FN_not_shortlisted")
-                   for c in sorted(true_ids - pred)]
-        for cand_id, kind in errors:
-            a, b = s1_map[s1_id], target_map.get(cand_id, {})
-            score = score_of.get((s1_id, cand_id))
-            rows.append([
-                kind, s1_id, cand_id, "" if score is None else f"{score:.4f}",
-                a.get("business_name", ""), b.get("business_name", ""),
-                a.get("business_address", ""), b.get("business_address", ""),
-                a.get("country", ""), b.get("country", ""),
-            ])
+    kept = np.zeros(len(pairs), dtype=bool)
+    kept[keep] = True
+    fp = np.flatnonzero(kept & (labels == 0))
+    fn = np.flatnonzero(~kept & (labels == 1))
+    link_s1, link_tgt = data["links"]
+    in_rows = np.isin(link_s1, rows)
+    cand_keys = train.pair_keys(pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy(),
+                                len(data["tgt"]))
+    link_keys = train.pair_keys(link_s1, np.maximum(link_tgt, 0), len(data["tgt"]))
+    missed = np.flatnonzero(in_rows & ~np.isin(link_keys, cand_keys))
 
+    s1_rows = np.concatenate([pairs["s1_idx"].to_numpy()[fp], pairs["s1_idx"].to_numpy()[fn],
+                              link_s1[missed]])
+    tgt_rows = np.concatenate([pairs["tgt_idx"].to_numpy()[fp], pairs["tgt_idx"].to_numpy()[fn],
+                               link_tgt[missed]])
+    kinds = ["FP"] * len(fp) + ["FN_scored"] * len(fn) + ["FN_not_candidate"] * len(missed)
+    score_col = [f"{s:.4f}" for s in scores[fp]] + [f"{s:.4f}" for s in scores[fn]] \
+        + [""] * len(missed)
+
+    s1, tgt = data["s1"], data["tgt"]
+    valid_tgt = np.maximum(tgt_rows, 0)
+    cols = {
+        "error": kinds,
+        "s1_id": prune.take_strings(s1, "entity_id", s1_rows),
+        "cand_id": prune.take_strings(tgt, "entity_id", valid_tgt),
+        "score": score_col,
+        "s1_name": prune.take_strings(s1, "business_name", s1_rows),
+        "cand_name": prune.take_strings(tgt, "business_name", valid_tgt),
+        "s1_address": prune.take_strings(s1, "business_address", s1_rows),
+        "cand_address": prune.take_strings(tgt, "business_address", valid_tgt),
+        "s1_country": prune.take_strings(s1, "country", s1_rows),
+        "cand_country": prune.take_strings(tgt, "country", valid_tgt),
+    }
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("error\ts1_id\tcand_id\tscore\ts1_name\tcand_name\t"
-                "s1_address\tcand_address\ts1_country\tcand_country\n")
-        for row in rows:
-            f.write("\t".join(str(x).replace("\t", " ") for x in row) + "\n")
-    return len(rows)
+    pd.DataFrame(cols).to_csv(path, sep="\t", index=False, quoting=3, escapechar="\\")
+    return len(kinds)
 
 
 def save_run_info(mode: str, info: dict) -> None:
     """
     Save the key numbers of a run to <model_dir>/run_info_<mode>.json.
 
-    These are the numbers to copy into submissions/LOG.md.
+    These are the numbers to copy into submissions/LOG.md and PR descriptions.
 
     Args:
         mode: 'validate', 'loco' or 'test'.
@@ -380,9 +446,13 @@ def save_run_info(mode: str, info: dict) -> None:
     path = os.path.join(config.MODEL_DIR, f"run_info_{mode}.json")
     info = {"mode": mode, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "use_embeddings": config.USE_EMBEDDINGS,
-            "feature_groups": config.FEATURE_GROUPS, **info}
+            "feature_groups": config.FEATURE_GROUPS,
+            "blocking_top_k": config.BLOCKING_TOP_K,
+            "blocking_max_df": config.BLOCKING_MAX_DF,
+            "prune_top_n": config.PRUNE_TOP_N, "prune_min_prob": config.PRUNE_MIN_PROB,
+            **info}
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(info, f, indent=2)
+        json.dump(info, f, indent=2, default=float)
     print(f"  ✓ Run info saved to {path}")
 
 
@@ -390,86 +460,76 @@ def save_run_info(mode: str, info: dict) -> None:
 # Modes
 # ──────────────────────────────────────────────────────────────────────
 
-def run_validate(verbose: bool = True):
+def run_validate(sample_s1: int = None, verbose: bool = True) -> float:
     """
-    Run the validation pipeline and report macro F0.5 on a held-out split.
+    Validation: fit on 80% of train S1 entities, score the untouched 20%.
 
     Args:
+        sample_s1: Optional number of train S1 records to use.
         verbose: Whether to print progress.
 
     Returns:
         Holdout macro F0.5.
     """
     start_time = time.time()
-    print("=" * 60)
+    print("=" * 70)
     print("VALIDATION MODE")
-    print("=" * 60)
+    print("=" * 70)
 
-    data = load_split("train", verbose=verbose)
-    gt = data["ground_truth"]
+    data = load_split("train", sample_s1, verbose)
+    cand = build_candidates(data, verbose=verbose)
+    pairs, labels = cand["pairs"], cand["labels"]
+    X, names = stage3_features(data, pairs, verbose)
 
-    print("\n[pairs] Blocking + features for all train S1 entities...")
-    built = build_pairs(data, verbose=verbose)
-    blocking.evaluate_blocking_recall(built["candidates"], gt,
-                                      sources=built["sources"], verbose=verbose)
+    dev_rows, hold_rows = train.holdout_split_rows(len(data["s1"]))
+    is_dev = np.isin(pairs["s1_idx"].to_numpy(), dev_rows)
+    dev, hold = np.flatnonzero(is_dev), np.flatnonzero(~is_dev)
+    print(f"\n  Dev S1: {len(dev_rows):,} ({len(dev):,} pairs), "
+          f"Holdout S1: {len(hold_rows):,} ({len(hold):,} pairs)")
 
-    # Split S1 entities: dev (fit + CV) and an untouched holdout
-    dev_ids, holdout_ids = train.holdout_split_s1(data["s1_ids"])
-    print(f"\n  Dev S1: {len(dev_ids)}, Holdout S1: {len(holdout_ids)}")
-    dev_gt = {k: gt[k] for k in dev_ids}
-    holdout_gt = {k: gt[k] for k in holdout_ids}
-
-    X_dev, pairs_dev = select_pairs(built, dev_ids)
-    fitted = fit_matcher(X_dev, pairs_dev, built["feature_names"], dev_gt,
-                         sorted(dev_ids), verbose=verbose)
+    fitted = fit_matcher(X[dev], pairs.iloc[dev], labels[dev], data["n_true_by_row"],
+                         dev_rows, names, verbose)
 
     print("\n[holdout] Scoring held-out S1 entities...")
-    holdout_candidates = {s: built["candidates"].get(s, []) for s in holdout_ids}
-    holdout_recall = blocking.evaluate_blocking_recall(
-        holdout_candidates, holdout_gt, verbose=verbose
-    )
-    X_hold, pairs_hold = select_pairs(built, holdout_ids)
-    predictions, scores = predict_matches(fitted, X_hold, pairs_hold, sorted(holdout_ids))
-
-    f05, precision, recall = evaluate.macro_f05_with_details(predictions, holdout_gt)
-    empty_f05 = evaluate.macro_f05({}, holdout_gt)
-    by_country = report_by_country(predictions, holdout_gt, data["s1_map"])
+    hold_pairs, hold_labels = pairs.iloc[hold].reset_index(drop=True), labels[hold]
+    scores = predict.predict_scores(fitted["model"], X[hold])
+    keep = predict.decide(scores, hold_pairs["s1_idx"].to_numpy(),
+                          hold_pairs["tgt_idx"].to_numpy(), hold_pairs["is_s2"].to_numpy(),
+                          fitted["threshold"])
+    metrics = evaluate_rows(hold_pairs, hold_labels, keep, data["n_true_by_row"], hold_rows)
+    by_country = report_by_country(data, hold_pairs, hold_labels, keep, hold_rows)
 
     if config.WRITE_ERROR_DUMP:
         path = os.path.join(config.MODEL_DIR, "holdout_errors.tsv")
-        n_errors = write_error_dump(path, predictions, holdout_gt, holdout_candidates,
-                                    pairs_hold, scores, data["s1_map"], data["target_map"])
-        print(f"\n  ✓ {n_errors} holdout errors written to {path}")
+        n = write_error_dump(path, data, hold_pairs, hold_labels, scores, keep, hold_rows)
+        print(f"\n  ✓ {n:,} holdout errors written to {path}")
 
     elapsed = time.time() - start_time
-    print("\n" + "=" * 60)
-    print(f"  Holdout macro F0.5:    {f05:.4f}   (all-empty baseline {empty_f05:.4f})")
-    print(f"  Holdout precision:     {precision:.4f}")
-    print(f"  Holdout recall:        {recall:.4f}")
-    print(f"  Holdout block recall:  {holdout_recall:.4f}")
-    print(f"  OOF F0.5 (dev):        {fitted['oof_f05']:.4f}")
-    print(f"  Threshold:             {predict.format_threshold(fitted['threshold'])}")
-    print(f"  Time elapsed:          {elapsed:.1f}s")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print(f"  Holdout macro F0.5:      {metrics['f05']:.4f}   "
+          f"(all-empty baseline {metrics['all_empty_f05']:.4f})")
+    print(f"  Holdout precision:       {metrics['precision']:.4f}")
+    print(f"  Holdout recall:          {metrics['recall']:.4f}")
+    print(f"  Candidates per S1:       {metrics['candidates_per_s1']:.2f}   "
+          f"(stage 1: {cand['stage1']['mean_per_s1']:.2f})")
+    print(f"  Candidate recall:        {metrics['candidate_recall']:.4f}   "
+          f"(stage 1: {cand['stage1']['recall']:.4f})")
+    print(f"  OOF F0.5 (dev):          {fitted['oof_f05']:.4f}")
+    print(f"  Threshold:               {predict.format_threshold(fitted['threshold'])}")
+    print(f"  Time elapsed:            {elapsed:.0f}s")
+    print("=" * 70)
 
     save_run_info("validate", {
-        "holdout_f05": f05,
-        "holdout_precision": precision,
-        "holdout_recall": recall,
-        "holdout_blocking_recall": holdout_recall,
-        "all_empty_f05": empty_f05,
-        "holdout_by_country": by_country,
-        "oof_f05": fitted["oof_f05"],
-        "threshold": fitted["threshold"],
-        "num_boost_round": fitted["num_boost_round"],
-        "n_features": len(built["feature_names"]),
+        "sample_s1": sample_s1, "holdout": metrics, "holdout_by_country": by_country,
+        "stage1": cand["stage1"], "stage2": cand["stage2"],
+        "oof_f05": fitted["oof_f05"], "threshold": fitted["threshold"],
+        "num_boost_round": fitted["num_boost_round"], "n_features": len(names),
         "elapsed_s": round(elapsed, 1),
     })
+    return metrics["f05"]
 
-    return f05
 
-
-def run_loco(verbose: bool = True) -> dict:
+def run_loco(sample_s1: int = None, verbose: bool = True) -> dict:
     """
     Leave-one-country-out: fit on all other train countries, evaluate on one.
 
@@ -479,63 +539,60 @@ def run_loco(verbose: bool = True) -> dict:
     which is the risk for France.
 
     Args:
+        sample_s1: Optional number of train S1 records to use.
         verbose: Whether to print progress.
 
     Returns:
         Dict country → results.
     """
     start_time = time.time()
-    print("=" * 60)
+    print("=" * 70)
     print("LEAVE-ONE-COUNTRY-OUT MODE")
-    print("=" * 60)
+    print("=" * 70)
 
-    data = load_split("train", verbose=verbose)
-    gt = data["ground_truth"]
-    built = build_pairs(data, verbose=verbose)
-
-    by_country = {}
-    for s1_id in data["s1_ids"]:
-        by_country.setdefault(data["s1_map"][s1_id].get("country_norm", ""), set()).add(s1_id)
+    data = load_split("train", sample_s1, verbose)
+    cand = build_candidates(data, verbose=verbose)
+    pairs, labels = cand["pairs"], cand["labels"]
+    X, names = stage3_features(data, pairs, verbose)
+    country = data["s1"]["country_norm"].to_numpy(dtype=object)
+    pair_country = country[pairs["s1_idx"].to_numpy()]
 
     results = {}
-    for country, held_ids in sorted(by_country.items()):
-        rest_ids = set(data["s1_ids"]) - held_ids
-        if len(held_ids) < config.LOCO_MIN_S1 or not rest_ids:
-            print(f"\n  Skipping '{country}' ({len(held_ids)} S1 entities)")
+    for c in sorted(set(country)):
+        held_rows = np.flatnonzero(country == c)
+        rest_rows = np.flatnonzero(country != c)
+        if len(held_rows) < config.LOCO_MIN_S1 or len(rest_rows) == 0:
+            print(f"\n  Skipping '{c}' ({len(held_rows)} S1 entities)")
             continue
-        print(f"\n[loco] Held-out country '{country}': fit on {len(rest_ids)} S1, "
-              f"evaluate on {len(held_ids)} S1...")
-        X_fit, pairs_fit = select_pairs(built, rest_ids)
-        fitted = fit_matcher(X_fit, pairs_fit, built["feature_names"],
-                             {k: gt[k] for k in rest_ids}, sorted(rest_ids),
-                             verbose=False)
-        X_held, pairs_held = select_pairs(built, held_ids)
-        held_gt = {k: gt[k] for k in held_ids}
-        predictions, scores = predict_matches(fitted, X_held, pairs_held, sorted(held_ids))
-        f05, p, r = evaluate.macro_f05_with_details(predictions, held_gt)
+        print(f"\n[loco] Held-out country '{c}': fit on {len(rest_rows):,} S1, "
+              f"evaluate on {len(held_rows):,} S1...")
+        fit_idx, held_idx = np.flatnonzero(pair_country != c), np.flatnonzero(pair_country == c)
+        fitted = fit_matcher(X[fit_idx], pairs.iloc[fit_idx], labels[fit_idx],
+                             data["n_true_by_row"], rest_rows, names, verbose=False)
+        held = pairs.iloc[held_idx].reset_index(drop=True)
+        args = (held["s1_idx"].to_numpy(), held["tgt_idx"].to_numpy(), held["is_s2"].to_numpy())
+        scores = predict.predict_scores(fitted["model"], X[held_idx])
+        keep = predict.decide(scores, *args, fitted["threshold"])
+        m = evaluate_rows(held, labels[held_idx], keep, data["n_true_by_row"], held_rows)
         oracle_t, oracle_f05 = predict.tune_threshold(
-            scores, pairs_held, held_gt, sorted(held_ids), verbose=False
-        )
-        results[country] = {
-            "n_s1": len(held_ids), "f05": f05, "precision": p, "recall": r,
-            "threshold": fitted["threshold"], "oracle_threshold": oracle_t,
-            "oracle_f05": oracle_f05,
-        }
+            scores, *args, labels[held_idx], data["n_true_by_row"], held_rows, verbose=False)
+        results[c] = {**m, "threshold": fitted["threshold"],
+                      "oracle_threshold": oracle_t, "oracle_f05": oracle_f05}
 
     elapsed = time.time() - start_time
-    print("\n" + "=" * 60)
-    print(f"  {'held out':>10s}  {'S1':>6s}  {'F0.5':>7s}  {'P':>7s}  {'R':>7s}  "
+    print("\n" + "=" * 70)
+    print(f"  {'held out':>10s}  {'S1':>8s}  {'F0.5':>7s}  {'P':>7s}  {'R':>7s}  "
           f"{'threshold':>18s}  {'oracle F0.5':>11s}  {'oracle thr':>18s}")
-    for country, res in results.items():
-        print(f"  {country or '(none)':>10s}  {res['n_s1']:>6d}  {res['f05']:>7.4f}  "
+    for c, res in results.items():
+        print(f"  {c or '(none)':>10s}  {res['n_s1']:>8,d}  {res['f05']:>7.4f}  "
               f"{res['precision']:>7.4f}  {res['recall']:>7.4f}  "
-              f"{predict.format_threshold(res['threshold']):>18s}  "
-              f"{res['oracle_f05']:>11.4f}  "
+              f"{predict.format_threshold(res['threshold']):>18s}  {res['oracle_f05']:>11.4f}  "
               f"{predict.format_threshold(res['oracle_threshold']):>18s}")
-    print(f"  Time elapsed: {elapsed:.1f}s")
-    print("=" * 60)
+    print(f"  Time elapsed: {elapsed:.0f}s")
+    print("=" * 70)
 
-    save_run_info("loco", {"results": results, "elapsed_s": round(elapsed, 1)})
+    save_run_info("loco", {"sample_s1": sample_s1, "results": results,
+                           "elapsed_s": round(elapsed, 1)})
     return results
 
 
@@ -561,120 +618,123 @@ def run_validator() -> None:
         print("  ✗ Validator FAILED — do not upload these files.")
 
 
-def run_test(verbose: bool = True):
+def run_test(verbose: bool = True) -> None:
     """
-    Run the test pipeline: fit on all train data → predict on test set →
-    write output files → validate them.
+    Fit on all train data → predict the test set → write outputs → validate.
 
     Args:
         verbose: Whether to print progress.
     """
     start_time = time.time()
-    print("=" * 60)
+    print("=" * 70)
     print("TEST MODE")
-    print("=" * 60)
+    print("=" * 70)
 
-    train_data = load_split("train", verbose=verbose)
-    gt = train_data["ground_truth"]
-
-    print("\n[pairs] Blocking + features for all train S1 entities...")
-    train_built = build_pairs(train_data, verbose=verbose)
-    train_recall = blocking.evaluate_blocking_recall(
-        train_built["candidates"], gt, sources=train_built["sources"], verbose=verbose
-    )
-    fitted = fit_matcher(train_built["X"], train_built["pairs"],
-                         train_built["feature_names"], gt, train_data["s1_ids"],
-                         verbose=verbose)
+    # ── Train ──
+    data = load_split("train", verbose=verbose)
+    cand = build_candidates(data, fit_final_pruner=True, verbose=verbose)
+    X, names = stage3_features(data, cand["pairs"], verbose)
+    fitted = fit_matcher(X, cand["pairs"], cand["labels"], data["n_true_by_row"],
+                         np.arange(len(data["s1"])), names, verbose)
+    pruner = cand["pruner"]
     train.save_model(fitted["model"])
+    train.save_model(pruner, os.path.join(config.MODEL_DIR, "pruner_model.pkl"))
+    train_info = {"stage1": cand["stage1"], "stage2": cand["stage2"]}
+    del data, cand, X
+    gc.collect()
 
-    print("\n[test] Loading test data...")
-    test_data = load_split("test", verbose=verbose)
-
-    print("\n[test] Blocking + scoring...")
-    test_built = build_pairs(test_data, verbose=verbose)
-    if test_built["feature_names"] != train_built["feature_names"]:
+    # ── Test ──
+    test = load_split("test", verbose=verbose)
+    tcand = build_candidates(test, pruner=pruner, verbose=verbose)
+    pairs = tcand["pairs"]
+    X_test, test_names = stage3_features(test, pairs, verbose)
+    if test_names != names:
         raise RuntimeError("Train and test feature columns differ — check config.")
-    test_predictions, _ = predict_matches(
-        fitted, test_built["X"], test_built["pairs"], test_data["s1_ids"]
-    )
+    scores = predict.predict_scores(fitted["model"], X_test)
+    keep = predict.decide(scores, pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy(),
+                          pairs["is_s2"].to_numpy(), fitted["threshold"])
 
-    # Write outputs; candidate_pairs = exactly the pairs the model scored
     print("\n[test] Writing output files...")
-    io_utils.write_matching_results(test_predictions, config.MATCHING_RESULTS)
-    io_utils.write_candidate_pairs(
-        {s1_id: test_built["candidates"].get(s1_id, []) for s1_id in test_data["s1_ids"]},
-        config.CANDIDATE_PAIRS,
-    )
+    s1, tgt = test["s1"], test["tgt"]
+    s1_ids = s1["entity_id"].tolist()
+    matches = io_utils.group_pairs(
+        prune.take_strings(s1, "entity_id", pairs["s1_idx"].to_numpy()[keep]),
+        prune.take_strings(tgt, "entity_id", pairs["tgt_idx"].to_numpy()[keep]))
+    candidates = io_utils.group_pairs(
+        prune.take_strings(s1, "entity_id", pairs["s1_idx"].to_numpy()),
+        prune.take_strings(tgt, "entity_id", pairs["tgt_idx"].to_numpy()))
+    io_utils.write_matching_results(matches, config.MATCHING_RESULTS, s1_ids)
+    io_utils.write_candidate_pairs(candidates, config.CANDIDATE_PAIRS, s1_ids)
 
-    test_s1_ids = test_data["s1_ids"]
-    n_matched = sum(1 for v in test_predictions.values() if v)
-    n_links = sum(len(v) for v in test_predictions.values())
-    matched_by_country = {}
-    for s1_id, matched in test_predictions.items():
-        country = test_data["s1_map"][s1_id].get("country_norm", "")
-        n, m = matched_by_country.get(country, (0, 0))
-        matched_by_country[country] = (n + 1, m + bool(matched))
-
+    country = s1["country_norm"].to_numpy(dtype=object)
+    matched_rows = np.zeros(len(s1), dtype=bool)
+    matched_rows[pairs["s1_idx"].to_numpy()[keep]] = True
     elapsed = time.time() - start_time
-    print("\n" + "=" * 60)
-    print(f"  Test S1 entities:      {len(test_s1_ids)}")
-    print(f"  With ≥1 match:         {n_matched} ({100 * n_matched / max(len(test_s1_ids), 1):.1f}%)")
-    for country, (n, m) in sorted(matched_by_country.items()):
-        print(f"    {country or '(none)':>12s}: {m}/{n} S1 matched ({100 * m / n:.1f}%)")
-    print(f"  Total matched links:   {n_links}")
+    print("\n" + "=" * 70)
+    print(f"  Test S1 entities:      {len(s1):,}")
+    print(f"  With ≥1 match:         {matched_rows.sum():,} ({matched_rows.mean():.1%})")
+    for c in sorted(set(country)):
+        sel = country == c
+        print(f"    {c or '(none)':>10s}: {matched_rows[sel].mean():.1%} of {sel.sum():,} S1 matched")
+    print(f"  Matched links:         {len(keep):,}")
+    print(f"  Candidates per S1:     {tcand['stage2']['mean_per_s1']:.2f} "
+          f"(stage 1: {tcand['stage1']['mean_per_s1']:.2f})")
     print(f"  Threshold (from OOF):  {predict.format_threshold(fitted['threshold'])}")
     print(f"  OOF F0.5 (train):      {fitted['oof_f05']:.4f}")
-    print(f"  Train blocking recall: {train_recall:.4f}")
+    print(f"  Train candidate recall: {train_info['stage2']['recall']:.4f} "
+          f"(stage 1: {train_info['stage1']['recall']:.4f})")
     print(f"  Output written to      {config.OUTPUT_DIR}")
-    print(f"  Time elapsed:          {elapsed:.1f}s")
-    print("=" * 60)
+    print(f"  Time elapsed:          {elapsed:.0f}s")
+    print("=" * 70)
 
     save_run_info("test", {
-        "oof_f05": fitted["oof_f05"],
-        "threshold": fitted["threshold"],
-        "num_boost_round": fitted["num_boost_round"],
-        "train_blocking_recall": train_recall,
-        "test_s1": len(test_s1_ids),
-        "test_s1_with_match": n_matched,
-        "test_links": n_links,
-        "test_matched_by_country": {c: {"s1": n, "matched": m}
-                                    for c, (n, m) in matched_by_country.items()},
-        "n_features": len(train_built["feature_names"]),
+        "oof_f05": fitted["oof_f05"], "threshold": fitted["threshold"],
+        "num_boost_round": fitted["num_boost_round"], "train": train_info,
+        "test_stage1": tcand["stage1"], "test_stage2": tcand["stage2"],
+        "test_s1": len(s1), "test_s1_with_match": int(matched_rows.sum()),
+        "test_links": int(len(keep)), "n_features": len(names),
         "elapsed_s": round(elapsed, 1),
     })
-
     run_validator()
 
 
 def main():
     """Main entry point for the pipeline."""
-    parser = argparse.ArgumentParser(
-        description="Business Entity Resolution Pipeline"
-    )
+    parser = argparse.ArgumentParser(description="Business Entity Resolution Pipeline")
     parser.add_argument(
-        "--mode",
-        choices=["validate", "loco", "test"],
-        required=True,
+        "--mode", choices=["validate", "loco", "test"], required=True,
         help="'validate' = local F0.5 on a train holdout; 'loco' = leave one "
              "country out; 'test' = predict on test set",
     )
     parser.add_argument("--data-dir", help="Folder with train/ and test/ (default: <repo>/dataset)")
     parser.add_argument("--output-dir", help="Where to write the TSVs (default: <repo>/output)")
-    parser.add_argument("--model-dir", help="Where to save the model, run info and "
+    parser.add_argument("--model-dir", help="Where to save models, cache, run info and "
                         "error dump (default: code/business_entity_resolution/models)")
+    parser.add_argument("--sample-s1", type=int, default=config.SAMPLE_S1,
+                        help="validate/loco: use this many random train S1 records "
+                             "(all S2/S3 kept). Default: all")
     parser.add_argument("--embeddings", action="store_true",
-                        help="Turn on config.USE_EMBEDDINGS for this run")
+                        help="Turn on config.USE_EMBEDDINGS for this run (GPU recommended)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Do not read/write the normalized parquet cache")
+    parser.add_argument("--n-jobs", type=int, help="Worker processes (default: all cores)")
     args = parser.parse_args()
 
     config.set_paths(args.data_dir, args.output_dir, args.model_dir)
     if args.embeddings:
         config.USE_EMBEDDINGS = True
+    if args.no_cache:
+        config.USE_NORMALIZE_CACHE = False
+    if args.n_jobs:
+        config.N_JOBS = args.n_jobs
+        config.LGBM_PARAMS["n_jobs"] = args.n_jobs
+        config.PRUNER_PARAMS["n_jobs"] = args.n_jobs
     np.random.seed(config.RANDOM_SEED)
 
     if args.mode == "validate":
-        run_validate()
+        run_validate(args.sample_s1)
     elif args.mode == "loco":
-        run_loco()
+        run_loco(args.sample_s1)
     elif args.mode == "test":
         run_test()
 

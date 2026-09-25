@@ -1,0 +1,6 @@
+# Optional: only for --embeddings / config.USE_EMBEDDINGS (GPU recommended).
+# Model: intfloat/multilingual-e5-small (MIT, 118M) — see MODELS.md
+-r requirements.txt
+sentence-transformers==3.3.1
+transformers==4.46.3
+torch==2.5.1

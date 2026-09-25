@@ -75,25 +75,48 @@ RANDOM_SEED = 42
 VAL_SPLIT_RATIO = 0.2
 
 # Folds for group-aware (by S1 entity) cross-validation. Out-of-fold scores
-# pick the threshold and the number of boosting rounds.
-CV_FOLDS = 5
+# pick the threshold and the number of boosting rounds. (3, not 5: the real
+# train set gives ~10M candidate pairs, so each fold is already large.)
+CV_FOLDS = 3
 
 # ──────────────────────────────────────────────────────────────────────
-# Blocking parameters
+# Scale (the real data is ~12M records per split: S1 ~2M, S2/S3 ~5M each)
 # ──────────────────────────────────────────────────────────────────────
 
-# Top-K candidates per blocker per S1 entity
-BLOCKING_TOP_K_TFIDF_NAME = 50
-BLOCKING_TOP_K_TFIDF_COMBINED = 30
-BLOCKING_TOP_K_EMBEDDING = 20
+# Worker processes for normalization and blocking (all cores)
+N_JOBS = os.cpu_count() or 1
 
-# Exact-key blockers (postal code, first name token): a key shared by more
-# than this many S2/S3 records (e.g. a busy PIN code, "sri", "the") is too
-# unspecific and is skipped; the TF-IDF blockers still cover those records.
-BLOCKING_EXACT_KEY_MAX_BLOCK = 50
+# --mode validate / loco: use a random sample of this many train S1 entities
+# (all S2/S3 records stay in the pool, so difficulty is realistic).
+# None = all ~2.2M. Override per run with --sample-s1.
+SAMPLE_S1 = None
 
-# First-name-token keys shorter than this are skipped ("a", "m", "de", ...)
-BLOCKING_FIRST_TOKEN_MIN_LEN = 3
+# Normalized source files are cached as parquet in <model_dir>/cache and
+# reused until the raw file or normalize.py changes.
+USE_NORMALIZE_CACHE = True
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 1 — blocking (broad, cheap, high recall)
+# ──────────────────────────────────────────────────────────────────────
+
+# Hashed TF-IDF over word 1-2 grams, per source, searched per country:
+#   "name":     name_core
+#   "combined": name_norm + address_norm
+# Top-K per blocker per source per S1 entity.
+BLOCKING_TOP_K = {"name": 10, "combined": 10}
+BLOCKING_TOP_K_EMBEDDING = 10
+
+# Terms (words or word pairs) found in more than this many S2/S3 records of
+# a source are dropped from blocking: they are too common to identify a
+# business ("limited", "road", "delhi") and they make the sparse product huge.
+# Word pairs ("newton road", "prime realty") are much rarer, so they survive.
+BLOCKING_MAX_DF = 2000
+
+# Hash space for the TF-IDF vectorizers (collisions are negligible at 2^22)
+HASH_FEATURES = 2 ** 22
+
+# S1 rows per sparse-product chunk (memory per worker ~ chunk x postings)
+BLOCKING_CHUNK_ROWS = 2000
 
 # Only compare records with the same country string. S1 records with no
 # country, and countries with no S2/S3 records at all (e.g. "India" vs "IN"
@@ -101,8 +124,33 @@ BLOCKING_FIRST_TOKEN_MIN_LEN = 3
 # with no country are searched from every country.
 BLOCK_BY_COUNTRY = True
 
-# TF-IDF char n-gram range
-TFIDF_NGRAM_RANGE = (3, 4)
+# ──────────────────────────────────────────────────────────────────────
+# Stage 2 — pruning (makes candidate_pairs.tsv small)
+# ──────────────────────────────────────────────────────────────────────
+# A light LightGBM on cheap features (blocker scores/ranks + a few rapidfuzz
+# similarities) ranks each S1's stage-1 candidates. The kept pairs are the
+# exact set the final model scores = candidate_pairs.tsv. Smaller candidate
+# sets per S1 rank higher in the final evaluation, so this is tuned for
+# "as few as possible without losing true matches".
+
+PRUNE_TOP_N = 10          # keep at most this many candidates per S1 (both sources)
+PRUNE_MIN_PROB = 0.01     # ...and only those with pruner probability ≥ this
+PRUNE_FOLDS = 2           # out-of-fold pruning on train (by S1 entity)
+PRUNE_ROUNDS = 200        # boosting rounds for the pruner
+PRUNE_MAX_TRAIN_PAIRS = 20_000_000  # subsample S1 entities above this
+
+PRUNER_PARAMS = {
+    "objective": "binary",
+    "learning_rate": 0.1,
+    "num_leaves": 31,
+    "min_child_samples": 50,
+    "feature_fraction": 0.9,
+    "verbose": -1,
+    "seed": RANDOM_SEED,
+    "n_jobs": N_JOBS,
+    "deterministic": True,
+    "force_row_wise": True,
+}
 
 # ──────────────────────────────────────────────────────────────────────
 # Embeddings (optional: needs sentence-transformers + model download,
@@ -118,26 +166,28 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 
 # e5 models expect this prefix on every input text
 EMBEDDING_PREFIX = "query: "
-EMBEDDING_BATCH_SIZE = 256
+EMBEDDING_BATCH_SIZE = 512
 
 # ──────────────────────────────────────────────────────────────────────
-# Pair features — switch whole groups on/off for ablations
+# Stage 3 — pair features for the final matcher. Switch whole groups on/off
+# for ablations.
 # ──────────────────────────────────────────────────────────────────────
 
 FEATURE_GROUPS = {
     "string": True,     # rapidfuzz similarities on name / name_core / address
     "tokens": True,     # token Jaccard / overlap on name_core and address
-    "tfidf": True,      # TF-IDF cosine: name chars, address chars, name+address words
+    "tfidf": True,      # blocking TF-IDF cosines (name, name+address) + their ranks
     "numbers": True,    # overlap of all numbers in the address
     "structure": True,  # postal code / house number / country / lengths / missing / source
     "rank": True,       # rank + gap to best within the S1's candidates and the
                         # candidate's S1s, mutual best, candidate counts
     "blockers": True,   # which blockers produced the pair
+    "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)
 }
 
-# Pairs per chunk for the TF-IDF / embedding row-wise cosine (memory bound)
-FEATURE_CHUNK_SIZE = 200_000
+# Pairs per chunk when computing features / cosines (memory bound)
+FEATURE_CHUNK_SIZE = 1_000_000
 
 # ──────────────────────────────────────────────────────────────────────
 # Model (LightGBM) hyperparameters
@@ -148,16 +198,14 @@ LGBM_PARAMS = {
     "metric": "binary_logloss",
     "boosting_type": "gbdt",
     "num_leaves": 63,
-    "learning_rate": 0.05,
+    "learning_rate": 0.1,
     "feature_fraction": 0.8,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
     "min_child_samples": 20,
     "verbose": -1,
     "seed": RANDOM_SEED,
-    # Physical cores ≈ logical / 2. All logical threads was ~2x slower on a
-    # 16-thread laptop (thread contention on small data).
-    "n_jobs": max(1, (os.cpu_count() or 2) // 2),
+    "n_jobs": N_JOBS,
     # Bit-for-bit reproducible trees (organizers rerun top teams' code)
     "deterministic": True,
     "force_row_wise": True,

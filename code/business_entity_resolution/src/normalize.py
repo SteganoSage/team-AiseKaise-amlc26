@@ -10,10 +10,17 @@ Handles the noise patterns described in CLAUDE.md §1:
 - Postal code extraction (US ZIP, India PIN, France CP)
 
 All normalization is country-agnostic to handle unseen countries at test time.
+
+Scale: normalize_frame() works on whole columns in parallel worker processes
+and returns compact string columns (no per-record Python dicts), so ~12M
+records per split fit in memory.
 """
 
+import multiprocessing as mp
 import re
 import unicodedata
+
+import pandas as pd
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -317,11 +324,16 @@ def extract_name_core(normalized_name: str) -> str:
     return name
 
 
+# Placeholder words that appear literally in real addresses ("New Delhi, null, A-68")
+NULL_TOKENS = {"null", "none", "nan"}
+
+
 def normalize_address(address: str) -> str:
     """
     Normalize a business address.
 
-    Applies base normalization, then expands address abbreviations.
+    Applies base normalization, expands address abbreviations and drops
+    placeholder tokens such as a literal "null".
 
     Args:
         address: Raw business address string.
@@ -331,7 +343,7 @@ def normalize_address(address: str) -> str:
     """
     text = normalize_text(address)
     text = expand_abbreviations(text, ADDRESS_ABBREVIATIONS)
-    return text
+    return " ".join(t for t in text.split() if t not in NULL_TOKENS)
 
 
 def extract_postal_codes(text: str) -> list:
@@ -381,47 +393,92 @@ def get_tokens(text: str) -> set:
 
 def normalize_record(row: dict) -> dict:
     """
-    Normalize all fields of a single business record and produce derived fields.
+    Normalize a single record (for notebooks / debugging one pair).
 
-    Input row must have: entity_id, business_name, business_address, country.
-    Output adds: name_norm, name_core, address_norm, country_norm,
-                 postal_codes, house_number, address_numbers, name_tokens,
-                 address_tokens.
+    The pipeline itself uses normalize_frame, which produces the same fields
+    as columns for millions of records.
 
     Args:
-        row: Dict with raw record fields.
+        row: Dict with business_name, business_address, country.
 
     Returns:
-        Dict with original fields plus all normalized/derived fields.
+        Dict with the original fields plus every NORMALIZED_COLUMNS field.
     """
-    result = dict(row)
-
-    # Normalize core fields
-    result["name_norm"] = normalize_name(row.get("business_name", ""))
-    result["name_core"] = extract_name_core(result["name_norm"])
-    result["address_norm"] = normalize_address(row.get("business_address", ""))
-    result["country_norm"] = normalize_text(row.get("country", ""))
-
-    # Extract structured bits
-    result["postal_codes"] = extract_postal_codes(result["address_norm"])
-    result["house_number"] = extract_house_number(result["address_norm"])
-    result["address_numbers"] = set(NUMBER_RE.findall(result["address_norm"]))
-
-    # Token sets for blocking and features
-    result["name_tokens"] = get_tokens(result["name_core"])
-    result["address_tokens"] = get_tokens(result["address_norm"])
-
-    return result
+    out = _normalize_chunk(([row.get("business_name", "")],
+                            [row.get("business_address", "")],
+                            [row.get("country", "")]))
+    return {**row, **{col: values[0] for col, values in out.items()}}
 
 
-def normalize_dataframe(df) -> list:
+# Columns added by normalize_frame. Multi-valued fields (postal codes, all
+# numbers) are stored as space-separated strings to stay compact.
+NORMALIZED_COLUMNS = [
+    "name_norm",        # lowercased, accents stripped, abbreviations expanded
+    "name_core",        # name_norm without legal suffixes
+    "address_norm",     # normalized address
+    "country_norm",     # normalized country string (open set)
+    "postal_codes",     # 5-6 digit numbers in the address, space-separated
+    "house_number",     # leading number of the address ("" if none)
+    "address_numbers",  # every distinct number in the address, space-separated
+]
+
+
+def _normalize_chunk(chunk: tuple) -> dict:
     """
-    Normalize all records in a DataFrame.
+    Normalize one chunk of records (runs inside a worker process).
 
     Args:
-        df: pandas DataFrame with entity_id, business_name, business_address, country.
+        chunk: Tuple of (names, addresses, countries) lists.
 
     Returns:
-        List of normalized record dicts.
+        Dict column name → list of values, one per record.
     """
-    return [normalize_record(row) for row in df.to_dict("records")]
+    names, addresses, countries = chunk
+    out = {col: [] for col in NORMALIZED_COLUMNS}
+    for name, address, country in zip(names, addresses, countries):
+        name_norm = normalize_name(name or "")
+        address_norm = normalize_address(address or "")
+        out["name_norm"].append(name_norm)
+        out["name_core"].append(extract_name_core(name_norm))
+        out["address_norm"].append(address_norm)
+        out["country_norm"].append(normalize_text(country or ""))
+        out["postal_codes"].append(" ".join(extract_postal_codes(address_norm)))
+        out["house_number"].append(extract_house_number(address_norm))
+        out["address_numbers"].append(" ".join(sorted(set(NUMBER_RE.findall(address_norm)))))
+    return out
+
+
+def normalize_frame(df: pd.DataFrame, n_jobs: int = 1,
+                    chunk_size: int = 250_000) -> pd.DataFrame:
+    """
+    Normalize every record of a source DataFrame, in parallel.
+
+    Args:
+        df: DataFrame with business_name, business_address, country.
+        n_jobs: Worker processes (1 = run in this process).
+        chunk_size: Records per worker task.
+
+    Returns:
+        Copy of df with the NORMALIZED_COLUMNS added as compact string columns.
+    """
+    names = df["business_name"].tolist()
+    addresses = df["business_address"].tolist()
+    countries = df["country"].tolist()
+    chunks = [
+        (names[i:i + chunk_size], addresses[i:i + chunk_size], countries[i:i + chunk_size])
+        for i in range(0, len(names), chunk_size)
+    ]
+
+    if n_jobs > 1 and len(chunks) > 1:
+        with mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn") \
+                .Pool(min(n_jobs, len(chunks))) as pool:
+            results = pool.map(_normalize_chunk, chunks)
+    else:
+        results = [_normalize_chunk(c) for c in chunks]
+
+    string_dtype = df["business_name"].dtype
+    out = df.copy()
+    for col in NORMALIZED_COLUMNS:
+        values = [v for part in results for v in part[col]]
+        out[col] = pd.array(values, dtype=string_dtype)
+    return out
