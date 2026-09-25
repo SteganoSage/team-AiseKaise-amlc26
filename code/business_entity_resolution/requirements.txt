@@ -1,24 +1,21 @@
+# Works on Python 3.10-3.12 (all pins have wheels for 3.10, e.g. SageMaker's
+# conda_python3, and 3.12). Kaggle ships most of these; there, only
+# `pip install rapidfuzz==3.10.1` is usually needed.
+
 # Core
 pandas==2.2.3
 numpy==1.26.4
+scipy==1.13.1
 scikit-learn==1.5.2
+pyarrow==17.0.0          # compact string columns + normalized parquet cache
 
 # String matching
 rapidfuzz==3.10.1
 
-# Gradient boosting
+# Gradient boosting (pruner + matcher)
 lightgbm==4.5.0
-
-# Approximate nearest neighbors
-faiss-cpu==1.9.0
-
-# Embeddings (MIT-licensed model)
-sentence-transformers==3.3.1
-transformers==4.46.3
-torch==2.5.1
-
-# Unicode normalization
-unidecode==1.3.8
 
 # Progress bars
 tqdm==4.67.1
+
+# Optional embeddings (--embeddings, GPU): pip install -r requirements-embeddings.txt

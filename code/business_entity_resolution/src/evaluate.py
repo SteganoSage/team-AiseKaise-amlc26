@@ -12,7 +12,13 @@ Edge cases (per S1 entity):
 - otherwise: standard P/R → F0.5 (0 if no overlap)
 
 Precision is weighted 2× over recall — false merges are expensive.
+
+The dict-based functions are the reference implementation; the pipeline uses
+the vectorized per_s1_counts + macro_f05_from_counts (same edge cases) to
+score millions of S1 entities quickly.
 """
+
+import numpy as np
 
 
 def f05_score(precision: float, recall: float) -> float:
@@ -132,3 +138,67 @@ def macro_f05_with_details(predictions: dict, ground_truth: dict) -> tuple:
 
     n = max(len(f05_scores), 1)
     return sum(f05_scores) / n, sum(precisions) / n, sum(recalls) / n
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Vectorized version for millions of S1 entities (same edge cases)
+# ──────────────────────────────────────────────────────────────────────
+
+def per_s1_counts(universe: np.ndarray, n_true_by_row: np.ndarray,
+                  kept_s1: np.ndarray, kept_label: np.ndarray) -> tuple:
+    """
+    Per-S1 counts of true links, predicted links and correct predictions.
+
+    Args:
+        universe: S1 row indices being evaluated (every one counts, including
+            S1s with no candidates or no predictions).
+        n_true_by_row: Number of true links per S1 row (all S1 rows).
+        kept_s1: S1 row of each predicted pair.
+        kept_label: 1 if the predicted pair is a true link, else 0.
+
+    Returns:
+        Tuple (n_true, n_pred, n_tp) arrays aligned with `universe`.
+    """
+    n_rows = len(n_true_by_row)
+    n_pred = np.bincount(kept_s1, minlength=n_rows)
+    n_tp = np.bincount(kept_s1, weights=kept_label, minlength=n_rows)
+    return n_true_by_row[universe], n_pred[universe], n_tp[universe]
+
+
+def macro_f05_from_counts(n_true: np.ndarray, n_pred: np.ndarray,
+                          n_tp: np.ndarray) -> tuple:
+    """
+    Macro F0.5 / precision / recall from per-S1 counts.
+
+    Same edge cases as macro_f05_with_details:
+    - true empty & pred empty      → F0.5 1, P 1, R 1
+    - true empty & pred non-empty  → F0.5 0, P 0, R 1
+    - true non-empty & pred empty  → F0.5 0, P 0, R 0
+    - otherwise standard P/R → F0.5 (0 if no overlap)
+
+    Args:
+        n_true: True links per S1.
+        n_pred: Predicted links per S1.
+        n_tp: Correct predicted links per S1.
+
+    Returns:
+        Tuple (macro_f05, macro_precision, macro_recall).
+    """
+    n_true = np.asarray(n_true, dtype=np.float64)
+    n_pred = np.asarray(n_pred, dtype=np.float64)
+    n_tp = np.asarray(n_tp, dtype=np.float64)
+    if len(n_true) == 0:
+        return 0.0, 0.0, 0.0
+
+    both_empty = (n_true == 0) & (n_pred == 0)
+    only_pred = (n_true == 0) & (n_pred > 0)
+    normal = (n_true > 0) & (n_pred > 0)
+
+    p = np.where(normal, n_tp / np.maximum(n_pred, 1), 0.0)
+    r = np.where(normal, n_tp / np.maximum(n_true, 1), 0.0)
+    f = np.where(normal & (n_tp > 0), 1.25 * p * r / np.maximum(0.25 * p + r, 1e-12), 0.0)
+
+    f = np.where(both_empty, 1.0, f)
+    p = np.where(both_empty, 1.0, p)
+    r = np.where(both_empty | only_pred, 1.0, r)
+    return float(f.mean()), float(p.mean()), float(r.mean())

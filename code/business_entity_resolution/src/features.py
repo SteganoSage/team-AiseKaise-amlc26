@@ -1,26 +1,26 @@
 """
-Pair feature extraction for the entity resolution classifier.
+Stage 3 — pair features for the final matching model.
 
-For each (S1, candidate) pair, computes a feature vector. Groups can be
-switched on/off in config.FEATURE_GROUPS for ablations:
+Computed only for the pruned candidate pairs (candidate_pairs.tsv), in
+chunks, straight from the compact normalized frames. Groups can be switched
+on/off in config.FEATURE_GROUPS for ablations:
 
 - string:    rapidfuzz ratio / partial_ratio / token_sort / token_set /
              Jaro-Winkler on name_norm, name_core and address_norm.
 - tokens:    token Jaccard / overlap on name_core and address tokens.
-- tfidf:     TF-IDF cosine on name chars, address chars, name+address words.
+- tfidf:     blocking TF-IDF cosines (name, name+address) and their ranks,
+             reused from stage 1 (no second vectorization of millions of rows).
 - numbers:   overlap of all numbers in the address.
 - structure: postal code / house number / country match flags, lengths,
              missing-field flags, source (S2 vs S3).
-- rank:      how a pair compares with its competitors — rank and gap to the
-             best among the S1's candidates and among the candidate's S1s,
-             mutual best, candidate counts. Needs the whole batch of pairs,
-             so always featurize all S1 records of a split in one call.
-- blockers:  which blockers produced the pair.
-- embedding: embedding cosine of names and of name+address (USE_EMBEDDINGS).
+- rank:      how a pair compares with its competitors in the candidate set —
+             rank and gap to the best among the S1's candidates and among the
+             candidate's S1s, mutual best, candidate counts.
+- blockers:  which blockers proposed the pair.
+- pruner:    stage-2 pruner probability.
+- embedding: embedding cosines (only when USE_EMBEDDINGS).
 
 All features are country-agnostic (no one-hot country) so France generalizes.
-Computation is vectorized over all pairs (rapidfuzz.process.cpdist runs in
-C++ on all cores) instead of a Python loop per pair.
 """
 
 import numpy as np
@@ -29,7 +29,8 @@ from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
 import config
-from blocking import BLOCKER_BITS, build_tfidf_index
+from blocking import BLOCKER_BITS, group_rank, rowwise_cosine
+from prune import take_strings
 
 
 # rapidfuzz scorers used on every text field; fuzz scores are 0-100, JW is 0-1
@@ -43,7 +44,7 @@ STRING_SCORERS = {
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Feature groups (each returns an ordered dict name → float32 array)
+# Feature groups on one chunk of pairs (lists of strings in, arrays out)
 # ──────────────────────────────────────────────────────────────────────
 
 def string_similarities(left: list, right: list, prefix: str) -> dict:
@@ -63,28 +64,29 @@ def string_similarities(left: list, right: list, prefix: str) -> dict:
     both = np.array([bool(a) and bool(b) for a, b in zip(left, right)])
     out = {}
     for name, (scorer, scale) in STRING_SCORERS.items():
-        scores = process.cpdist(left, right, scorer=scorer,
-                                dtype=np.float32, workers=-1)
+        scores = process.cpdist(left, right, scorer=scorer, dtype=np.float32, workers=-1)
         out[f"{prefix}_{name}"] = np.where(both, scores / scale, 0.0)
     return out
 
 
 def token_overlaps(left: list, right: list, prefix: str) -> dict:
     """
-    Token-set overlap features for aligned lists of token sets.
+    Token-set overlap features for aligned lists of space-separated strings.
 
     Args:
-        left: S1-side token sets, one per pair.
-        right: Candidate-side token sets, one per pair.
+        left: S1-side strings, one per pair.
+        right: Candidate-side strings, one per pair.
         prefix: Feature name prefix, e.g. "name".
 
     Returns:
         Dict with Jaccard, overlap count, and overlap as a fraction of each side.
     """
-    inter = np.array([len(a & b) for a, b in zip(left, right)], dtype=np.float32)
-    union = np.array([len(a | b) for a, b in zip(left, right)], dtype=np.float32)
-    len_left = np.array([len(a) for a in left], dtype=np.float32)
-    len_right = np.array([len(b) for b in right], dtype=np.float32)
+    left_sets = [set(s.split()) for s in left]
+    right_sets = [set(s.split()) for s in right]
+    inter = np.array([len(a & b) for a, b in zip(left_sets, right_sets)], dtype=np.float32)
+    len_left = np.array([len(a) for a in left_sets], dtype=np.float32)
+    len_right = np.array([len(b) for b in right_sets], dtype=np.float32)
+    union = len_left + len_right - inter
     return {
         f"{prefix}_jaccard": np.where(union > 0, inter / np.maximum(union, 1), 0.0),
         f"{prefix}_token_overlap": inter,
@@ -93,48 +95,13 @@ def token_overlaps(left: list, right: list, prefix: str) -> dict:
     }
 
 
-def tfidf_pair_cosine(left_texts: list, right_texts: list,
-                      left_idx: np.ndarray, right_idx: np.ndarray,
-                      analyzer: str, ngram_range: tuple) -> np.ndarray:
-    """
-    TF-IDF cosine for each pair, fitting one vocabulary on both sides.
-
-    Args:
-        left_texts: Texts of the unique S1 records.
-        right_texts: Texts of the unique candidate records.
-        left_idx: Per pair, index into left_texts.
-        right_idx: Per pair, index into right_texts.
-        analyzer: 'char_wb' or 'word'.
-        ngram_range: n-gram range for the vectorizer.
-
-    Returns:
-        float32 cosine per pair (0 if either text is empty).
-    """
-    out = np.zeros(len(left_idx), dtype=np.float32)
-    try:
-        _, matrix = build_tfidf_index(left_texts + right_texts,
-                                      analyzer=analyzer, ngram_range=ngram_range)
-    except ValueError:  # empty vocabulary (all texts empty)
-        return out
-    left_m = matrix[: len(left_texts)]
-    right_m = matrix[len(left_texts):]
-
-    # Rows are L2-normalized, so the row-wise dot product is the cosine
-    step = config.FEATURE_CHUNK_SIZE
-    for start in range(0, len(left_idx), step):
-        end = start + step
-        prod = left_m[left_idx[start:end]].multiply(right_m[right_idx[start:end]])
-        out[start:end] = np.asarray(prod.sum(axis=1)).ravel()
-    return out
-
-
 def number_overlaps(left: list, right: list) -> dict:
     """
     Overlap of all numbers found in the two addresses.
 
     Args:
-        left: S1-side address number sets, one per pair.
-        right: Candidate-side address number sets, one per pair.
+        left: S1-side address_numbers strings (space-separated numbers).
+        right: Candidate-side address_numbers strings.
 
     Returns:
         Dict with number Jaccard, overlap count, both-present and
@@ -150,218 +117,215 @@ def number_overlaps(left: list, right: list) -> dict:
     }
 
 
-def structure_features(left: list, right: list) -> dict:
+def structure_features(get) -> dict:
     """
-    Postal code, house number, country, length, missing-field and source features.
+    Postal code, house number, country, length, missing-field features.
 
     Args:
-        left: S1 records, one per pair.
-        right: Candidate records, one per pair.
+        get: Function (side, column) → list of strings for this chunk,
+            side in {"s1", "cand"}.
 
     Returns:
         Dict of feature name → array.
     """
-    def flags(fn) -> np.ndarray:
-        """Apply fn(s1_rec, cand_rec) → bool to every pair."""
-        return np.array([fn(a, b) for a, b in zip(left, right)], dtype=np.float32)
+    def flags(values) -> np.ndarray:
+        """Bool iterable → float32 array."""
+        return np.fromiter(values, dtype=np.float32)
 
-    def lengths(recs: list, field: str) -> np.ndarray:
-        """Length of a text field for every record."""
-        return np.array([len(r.get(field, "")) for r in recs], dtype=np.float32)
-
-    s1_name_len, cand_name_len = lengths(left, "name_norm"), lengths(right, "name_norm")
-    s1_addr_len, cand_addr_len = lengths(left, "address_norm"), lengths(right, "address_norm")
-    is_s2 = np.array([r["entity_id"].startswith("S2-") for r in right], dtype=np.float32)
-    is_s3 = np.array([r["entity_id"].startswith("S3-") for r in right], dtype=np.float32)
+    pc_l = [set(s.split()) for s in get("s1", "postal_codes")]
+    pc_r = [set(s.split()) for s in get("cand", "postal_codes")]
+    hn_l, hn_r = get("s1", "house_number"), get("cand", "house_number")
+    co_l, co_r = get("s1", "country_norm"), get("cand", "country_norm")
+    lengths = {
+        (side, col): np.fromiter((len(s) for s in get(side, col)), dtype=np.float32)
+        for side in ("s1", "cand") for col in ("name_norm", "address_norm")
+    }
+    s1_name, cand_name = lengths[("s1", "name_norm")], lengths[("cand", "name_norm")]
+    s1_addr, cand_addr = lengths[("s1", "address_norm")], lengths[("cand", "address_norm")]
 
     return {
-        "postal_code_match": flags(
-            lambda a, b: bool(set(a["postal_codes"]) & set(b["postal_codes"]))),
-        "postal_code_both_present": flags(
-            lambda a, b: bool(a["postal_codes"]) and bool(b["postal_codes"])),
-        "postal_code_either_present": flags(
-            lambda a, b: bool(a["postal_codes"]) or bool(b["postal_codes"])),
-        "house_number_match": flags(
-            lambda a, b: bool(a["house_number"]) and a["house_number"] == b["house_number"]),
-        "house_number_both_present": flags(
-            lambda a, b: bool(a["house_number"]) and bool(b["house_number"])),
-        "country_match": flags(
-            lambda a, b: bool(a["country_norm"]) and a["country_norm"] == b["country_norm"]),
-        "country_both_present": flags(
-            lambda a, b: bool(a["country_norm"]) and bool(b["country_norm"])),
-        "s1_name_len": s1_name_len,
-        "cand_name_len": cand_name_len,
-        "name_len_diff": np.abs(s1_name_len - cand_name_len),
-        "name_len_ratio": np.minimum(s1_name_len, cand_name_len)
-                          / np.maximum(np.maximum(s1_name_len, cand_name_len), 1),
-        "s1_addr_len": s1_addr_len,
-        "cand_addr_len": cand_addr_len,
-        "addr_len_diff": np.abs(s1_addr_len - cand_addr_len),
-        "s1_name_missing": (s1_name_len == 0).astype(np.float32),
-        "cand_name_missing": (cand_name_len == 0).astype(np.float32),
-        "s1_addr_missing": (s1_addr_len == 0).astype(np.float32),
-        "cand_addr_missing": (cand_addr_len == 0).astype(np.float32),
-        "is_s2": is_s2,
-        "is_s3": is_s3,
+        "postal_code_match": flags(bool(a & b) for a, b in zip(pc_l, pc_r)),
+        "postal_code_both_present": flags(bool(a) and bool(b) for a, b in zip(pc_l, pc_r)),
+        "postal_code_either_present": flags(bool(a) or bool(b) for a, b in zip(pc_l, pc_r)),
+        "house_number_match": flags(bool(a) and a == b for a, b in zip(hn_l, hn_r)),
+        "house_number_both_present": flags(bool(a) and bool(b) for a, b in zip(hn_l, hn_r)),
+        "country_match": flags(bool(a) and a == b for a, b in zip(co_l, co_r)),
+        "country_both_present": flags(bool(a) and bool(b) for a, b in zip(co_l, co_r)),
+        "s1_name_len": s1_name,
+        "cand_name_len": cand_name,
+        "name_len_diff": np.abs(s1_name - cand_name),
+        "name_len_ratio": np.minimum(s1_name, cand_name)
+                          / np.maximum(np.maximum(s1_name, cand_name), 1),
+        "s1_addr_len": s1_addr,
+        "cand_addr_len": cand_addr,
+        "addr_len_diff": np.abs(s1_addr - cand_addr),
+        "s1_name_missing": (s1_name == 0).astype(np.float32),
+        "cand_name_missing": (cand_name == 0).astype(np.float32),
+        "s1_addr_missing": (s1_addr == 0).astype(np.float32),
+        "cand_addr_missing": (cand_addr == 0).astype(np.float32),
     }
 
 
-def rank_features(s1_ids: list, cand_ids: list, sims: dict) -> dict:
+def chunk_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_rows: np.ndarray,
+                   tgt_rows: np.ndarray) -> dict:
     """
-    Compare each pair with its competitors.
+    All string-based feature groups for one chunk of pairs.
+
+    Args:
+        s1: Normalized S1 frame.
+        tgt: Normalized S2 + S3 frame.
+        s1_rows: S1 row per pair.
+        tgt_rows: Target row per pair.
+
+    Returns:
+        Ordered dict of feature name → array.
+    """
+    cache = {}
+
+    def get(side: str, column: str) -> list:
+        """Strings of one column for this chunk, fetched once."""
+        if (side, column) not in cache:
+            frame, rows = (s1, s1_rows) if side == "s1" else (tgt, tgt_rows)
+            cache[(side, column)] = take_strings(frame, column, rows)
+        return cache[(side, column)]
+
+    groups = config.FEATURE_GROUPS
+    cols = {}
+    if groups.get("string", True):
+        for field, prefix in (("name_norm", "name"), ("name_core", "name_core"),
+                              ("address_norm", "addr")):
+            cols.update(string_similarities(get("s1", field), get("cand", field), prefix))
+    if groups.get("tokens", True):
+        cols.update(token_overlaps(get("s1", "name_core"), get("cand", "name_core"), "name"))
+        cols.update(token_overlaps(get("s1", "address_norm"), get("cand", "address_norm"), "addr"))
+    if groups.get("numbers", True):
+        cols.update(number_overlaps(get("s1", "address_numbers"), get("cand", "address_numbers")))
+    if groups.get("structure", True):
+        cols.update(structure_features(get))
+    return cols
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Whole-candidate-set features
+# ──────────────────────────────────────────────────────────────────────
+
+def group_max(groups: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """
+    Maximum of `values` within each group, broadcast back to every element.
+
+    Args:
+        groups: Non-negative integer group id per element.
+        values: Values.
+
+    Returns:
+        Array of group maxima, aligned with values.
+    """
+    uniq, inverse = np.unique(groups, return_inverse=True)
+    best = np.full(len(uniq), -np.inf, dtype=np.float64)
+    np.maximum.at(best, inverse, values)
+    return best[inverse].astype(np.float32)
+
+
+def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
+    """
+    Compare each pair with its competitors in the candidate set.
 
     For every similarity in `sims`:
     - rank / gap to best among all candidates of the same S1
-    - rank / gap to best among all S1s that shortlisted the same candidate
+    - rank / gap to best among all S1s that have the same candidate
     - mutual best: best candidate for its S1 AND best S1 for its candidate
     Plus how many candidates the S1 has and how many S1s the candidate has.
 
     Args:
-        s1_ids: S1 entity ID per pair.
-        cand_ids: Candidate entity ID per pair.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
         sims: Dict short name → similarity array (higher = more similar).
 
     Returns:
         Dict of feature name → array.
     """
-    df = pd.DataFrame({"s1": s1_ids, "cand": cand_ids, **sims})
-    by_s1, by_cand = df.groupby("s1", sort=False), df.groupby("cand", sort=False)
     out = {}
-    for key in sims:
-        rank_s1 = by_s1[key].rank(ascending=False, method="min").to_numpy()
-        rank_cand = by_cand[key].rank(ascending=False, method="min").to_numpy()
-        out[f"rank_{key}_in_s1"] = rank_s1
-        out[f"gap_{key}_to_s1_best"] = (by_s1[key].transform("max") - df[key]).to_numpy()
-        out[f"rank_{key}_in_cand"] = rank_cand
-        out[f"gap_{key}_to_cand_best"] = (by_cand[key].transform("max") - df[key]).to_numpy()
+    for key, values in sims.items():
+        rank_s1 = group_rank(s1_idx, values)
+        rank_cand = group_rank(tgt_idx, values)
+        out[f"rank_{key}_in_s1"] = rank_s1.astype(np.float32)
+        out[f"gap_{key}_to_s1_best"] = group_max(s1_idx, values) - values
+        out[f"rank_{key}_in_cand"] = rank_cand.astype(np.float32)
+        out[f"gap_{key}_to_cand_best"] = group_max(tgt_idx, values) - values
         out[f"mutual_best_{key}"] = ((rank_s1 == 1) & (rank_cand == 1)).astype(np.float32)
-    out["n_cands_for_s1"] = by_s1["cand"].transform("size").to_numpy()
-    out["n_s1_for_cand"] = by_cand["s1"].transform("size").to_numpy()
+    out["n_cands_for_s1"] = np.bincount(s1_idx)[s1_idx].astype(np.float32)
+    _, inverse, counts = np.unique(tgt_idx, return_inverse=True, return_counts=True)
+    out["n_s1_for_cand"] = counts[inverse].astype(np.float32)
     return out
 
 
-def blocker_features(pairs: list, sources: dict) -> dict:
-    """
-    Which blockers produced each pair (from blocking.generate_candidates).
-
-    Args:
-        pairs: List of (s1_id, cand_id).
-        sources: Dict S1 entity_id → {candidate ID: BLOCKER_BITS bitmask}.
-
-    Returns:
-        Dict with one 0/1 flag per blocker and the number of blockers.
-    """
-    masks = np.array([sources[s].get(c, 0) for s, c in pairs], dtype=np.int64)
-    out = {}
-    for name, bit in BLOCKER_BITS.items():
-        if name == "embedding" and not config.USE_EMBEDDINGS:
-            continue
-        out[f"found_by_{name}"] = ((masks & bit) > 0).astype(np.float32)
-    out["n_blockers"] = np.sum(list(out.values()), axis=0).astype(np.float32)
-    return out
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Feature matrix
-# ──────────────────────────────────────────────────────────────────────
-
-def build_feature_matrix(s1_records_map: dict, candidate_records_map: dict,
-                         candidates: dict, sources: dict = None,
+def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFrame,
                          embeddings: dict = None, verbose: bool = True) -> tuple:
     """
-    Build a feature matrix for all candidate pairs.
+    Build the stage-3 feature matrix for the pruned candidate pairs.
 
-    Pass all S1 records of a split in one call: the rank features compare
-    each pair with the other pairs of the same S1 and the same candidate.
+    Pass the complete candidate set of a split in one call: the rank features
+    compare each pair with the other pairs of the same S1 and candidate.
 
     Args:
-        s1_records_map: Dict mapping S1 entity_id → normalized record dict.
-        candidate_records_map: Dict mapping S2/S3 entity_id → normalized record dict.
-        candidates: Dict mapping S1 entity_id → list of candidate entity_ids.
-        sources: Optional blocker bitmasks from blocking.generate_candidates.
-        embeddings: Optional output of embeddings.embed_records for this split.
+        pairs: Pruned pairs: s1_idx, tgt_idx, blockers, score_*/rank_*,
+            is_s2 and (optionally) pruner_prob.
+        s1: Normalized S1 frame.
+        tgt: Normalized S2 + S3 frame.
+        embeddings: Optional {"s1": {"name", "full"}, "tgt": {"name", "full"}}
+            embedding arrays aligned with the frames.
         verbose: Whether to print progress.
 
     Returns:
-        Tuple of:
-        - numpy array of shape (n_pairs, n_features), float32
-        - list of (s1_id, cand_id) tuples (same order as rows)
-        - list of feature names
+        Tuple (X float32 matrix, feature names).
     """
     groups = config.FEATURE_GROUPS
-    pairs = [
-        (s1_id, cand_id)
-        for s1_id in sorted(candidates)
-        for cand_id in candidates[s1_id]
-        if cand_id in candidate_records_map
-    ]
-    s1_ids = [p[0] for p in pairs]
-    cand_ids = [p[1] for p in pairs]
-    left = [s1_records_map[s] for s in s1_ids]
-    right = [candidate_records_map[c] for c in cand_ids]
+    s1_idx = pairs["s1_idx"].to_numpy()
+    tgt_idx = pairs["tgt_idx"].to_numpy()
 
-    cols = {}
-    if groups.get("string", True):
-        for field, prefix in (("name_norm", "name"), ("name_core", "name_core"),
-                              ("address_norm", "addr")):
-            cols.update(string_similarities(
-                [r[field] for r in left], [r[field] for r in right], prefix))
+    # String-based groups, chunk by chunk
+    chunks = []
+    step = config.FEATURE_CHUNK_SIZE
+    for start in range(0, len(pairs), step):
+        end = start + step
+        chunks.append(chunk_features(s1, tgt, s1_idx[start:end], tgt_idx[start:end]))
+    cols = {name: np.concatenate([c[name] for c in chunks]).astype(np.float32)
+            for name in (chunks[0] if chunks else {})}
 
-    if groups.get("tokens", True):
-        cols.update(token_overlaps([r["name_tokens"] for r in left],
-                                   [r["name_tokens"] for r in right], "name"))
-        cols.update(token_overlaps([r["address_tokens"] for r in left],
-                                   [r["address_tokens"] for r in right], "addr"))
-
-    tfidf = {}
-    if groups.get("tfidf", True) or groups.get("rank", True):
-        # Unique records on each side, so each text is vectorized once
-        u_s1 = list(dict.fromkeys(s1_ids))
-        u_cand = list(dict.fromkeys(cand_ids))
-        li = pd.Index(u_s1).get_indexer(s1_ids)
-        ri = pd.Index(u_cand).get_indexer(cand_ids)
-        s1_recs = [s1_records_map[s] for s in u_s1]
-        cand_recs = [candidate_records_map[c] for c in u_cand]
-        for name, text_fn, analyzer, ngrams in (
-            ("tfidf_name_char", lambda r: r["name_core"], "char_wb", config.TFIDF_NGRAM_RANGE),
-            ("tfidf_addr_char", lambda r: r["address_norm"], "char_wb", config.TFIDF_NGRAM_RANGE),
-            ("tfidf_name_addr_word", lambda r: r["name_norm"] + " " + r["address_norm"],
-             "word", (1, 2)),
-        ):
-            tfidf[name] = tfidf_pair_cosine(
-                [text_fn(r) for r in s1_recs], [text_fn(r) for r in cand_recs],
-                li, ri, analyzer, ngrams)
-        if groups.get("tfidf", True):
-            cols.update(tfidf)
-
-    if groups.get("numbers", True):
-        cols.update(number_overlaps([r["address_numbers"] for r in left],
-                                    [r["address_numbers"] for r in right]))
+    if groups.get("tfidf", True):
+        for c in pairs.columns:
+            if c.startswith(("score_", "rank_")) and not c.endswith("embedding"):
+                cols[f"blk_{c}"] = pairs[c].to_numpy(dtype=np.float32)
 
     if groups.get("structure", True):
-        cols.update(structure_features(left, right))
+        cols["is_s2"] = pairs["is_s2"].to_numpy(dtype=np.float32)
+
+    if groups.get("blockers", True):
+        mask = pairs["blockers"].to_numpy()
+        for name, bit in BLOCKER_BITS.items():
+            if name != "embedding" or config.USE_EMBEDDINGS:
+                cols[f"found_by_{name}"] = ((mask & bit) > 0).astype(np.float32)
+
+    if groups.get("pruner", True) and "pruner_prob" in pairs:
+        cols["pruner_prob"] = pairs["pruner_prob"].to_numpy(dtype=np.float32)
 
     if groups.get("rank", True):
-        cols.update(rank_features(s1_ids, cand_ids, {
-            "name": tfidf["tfidf_name_char"],
-            "combined": tfidf["tfidf_name_addr_word"],
-        }))
-
-    if groups.get("blockers", True) and sources is not None:
-        cols.update(blocker_features(pairs, sources))
+        sims = {"name": pairs["score_name"].to_numpy(dtype=np.float32),
+                "combined": pairs["score_combined"].to_numpy(dtype=np.float32)}
+        if "pruner_prob" in pairs:
+            sims["pruner"] = pairs["pruner_prob"].to_numpy(dtype=np.float32)
+        cols.update(rank_features(s1_idx, tgt_idx, sims))
 
     if groups.get("embedding", True) and embeddings is not None:
-        from embeddings import pair_cosine
-        cols["emb_name_cos"] = pair_cosine(embeddings, "name", s1_ids, cand_ids)
-        cols["emb_full_cos"] = pair_cosine(embeddings, "full", s1_ids, cand_ids)
+        for field in ("name", "full"):
+            cols[f"emb_{field}_cos"] = rowwise_cosine(
+                embeddings["s1"][field], embeddings["tgt"][field], s1_idx, tgt_idx)
+        if "score_embedding" in pairs:
+            cols["blk_rank_embedding"] = pairs["rank_embedding"].to_numpy(dtype=np.float32)
 
-    feature_names = list(cols)
-    if pairs:
-        X = np.column_stack([np.asarray(cols[n], dtype=np.float32) for n in feature_names])
-    else:
-        X = np.empty((0, len(feature_names)), dtype=np.float32)
-
+    names = list(cols)
+    X = np.column_stack([cols[n] for n in names]).astype(np.float32, copy=False) \
+        if len(pairs) else np.empty((0, len(names)), dtype=np.float32)
     if verbose:
-        print(f"  Built feature matrix: {len(pairs):,} pairs × {len(feature_names)} features")
-
-    return X, pairs, feature_names
+        print(f"  Stage-3 features: {len(pairs):,} pairs × {len(names)}")
+    return X, names

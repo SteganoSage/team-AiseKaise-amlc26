@@ -7,28 +7,40 @@ Window: **25 Sep 00:00 IST → 27 Sep 23:59 IST**. Max **5 leaderboard uploads p
 
 ## 1. Where we are
 
-The full baseline pipeline is in `code/business_entity_resolution/src/`:
+The full baseline pipeline is in `code/business_entity_resolution/src/`, rebuilt for the real data size
+(**~12M records per split**: S1 ~2M, S2 ~5M, S3 ~5M — see CLAUDE.md §2):
 
 ```
-normalize → blocking (shortlist candidates) → pair features → LightGBM → threshold → output TSVs
+normalize (parallel, cached)
+  → stage 1 blocking   hashed TF-IDF on name / name+address, top-K per S1, same country   (~20-40 per S1)
+  → stage 2 pruning    light LightGBM keeps the best few per S1 → candidate_pairs.tsv      (~1-10 per S1)
+  → stage 3 matching   ~70 features → LightGBM → threshold tuned for macro F0.5 → matching_results.tsv
 ```
 
-- It runs end to end, and its output passes the organizers' validator (`utils/validate_submission.py`).
-- **So far it has only been tested on a small fake dataset.** We have no real scores yet. The first real numbers come on Day 1, once the dataset is in.
-- `--mode validate` gives our local score: macro F0.5 on 20% of train S1 entities that the model never sees.
-- `--mode test` writes `output/matching_results.tsv` + `output/candidate_pairs.tsv` and runs the validator on them.
+- **Two numbers matter now** (official portal update): macro F0.5 on the leaderboard **and** how small
+  `candidate_pairs.tsv` is per S1 — smaller candidate sets rank higher in the final evaluation.
+  Every run prints both, plus candidate recall after each stage.
+- Runs end to end on fake data and on a small slice of the real train data; the output passes the
+  organizers' validator. **Full-size runs need ~30 GB RAM** → an AWS SageMaker notebook instance paid from our credits (§2), Kaggle as fallback. A laptop can't hold 12M records.
+- `--mode validate` → local score on a 20% holdout of train S1s (use `--sample-s1 200000` for quick runs).
+- `--mode loco` → leave one country out (train on India, test on US and vice versa) = our France check.
+- `--mode test` → writes `output/matching_results.tsv` + `output/candidate_pairs.tsv` and runs the validator.
+- Holdout errors (false positives, misses, true matches that never became candidates) are written to
+  `models/holdout_errors.tsv` — the best place to find the next idea.
 
 ## 2. How to run
 
-**Local**
+**Local** (small runs only — a laptop can't hold the full data)
 ```bash
 pip install -r code/business_entity_resolution/requirements.txt
-python code/business_entity_resolution/src/run_pipeline.py --mode validate   # local score
-python code/business_entity_resolution/src/run_pipeline.py --mode test       # writes output/*.tsv
+python code/business_entity_resolution/src/run_pipeline.py --mode validate --sample-s1 20000
 ```
-The dataset goes in `dataset/train/` and `dataset/test/`. Git ignores that folder, so it is never committed.
+The dataset goes in `dataset/train/` and `dataset/test/` (unzip the organizers' zip, move
+`student_resource/dataset/*` there). Git ignores that folder, so it is never committed.
+`make_test_data.py` writes fake data to `dataset_fake/` and never touches `dataset/`.
 
-**Kaggle** (turn Internet ON in notebook settings; GPU only needed for embedding models)
+**Kaggle** (fallback for full runs if SageMaker isn't set up; turn Internet ON; GPU only for `--embeddings`). Upload the
+`dataset/` folder (train + test TSVs, 2.5 GB) once as a **private** Kaggle dataset.
 ```python
 # One-time: add a GitHub token (read-only, this repo only) as a Kaggle Secret named GITHUB_TOKEN
 from kaggle_secrets import UserSecretsClient
@@ -42,13 +54,61 @@ token = UserSecretsClient().get_secret("GITHUB_TOKEN")
 To import our modules inside a notebook:
 `sys.path.insert(0, ".../code/business_entity_resolution/src")`. Put it at **position 0**, because our `evaluate.py` has the same name as a preinstalled Kaggle package.
 
+**AWS SageMaker** (recommended for full runs; paid from the **$200 AWS credits each participant gets**:
+$100 at signup + 5 × $20 console activities). From the organizers' prep guide (Jatin Mehrotra, AWS).
+
+The free tier is too small for our data: the free notebook `ml.t3.medium` has 2 vCPU / **4 GB RAM**,
+the free training hours are `ml.m5.xlarge` (16 GB). Use them only for editing and tiny tests. Full
+runs need ~30 GB, so pay for a bigger **notebook instance** from the credits:
+
+| Instance | vCPU / RAM | Use |
+|---|---|---|
+| `ml.r5.2xlarge` | 8 / 64 GB | full validate / test runs (cheapest with enough RAM) |
+| `ml.m5.4xlarge` | 16 / 64 GB | same, faster blocking + normalization |
+| `ml.g4dn.4xlarge` | 16 / 64 GB + T4 GPU | `--embeddings` runs |
+
+Check the hourly price on aws.amazon.com/sagemaker/pricing (notebook instances, us-east-1) before
+creating one. A full test run should take about 1–1.5 h, so the credits last the whole challenge
+**if the instance is stopped whenever nothing is running**.
+
+One-time setup (in **us-east-1**, as the guide recommends):
+1. Create a budget / billing alert first (AWS Budgets — it's also one of the $20 credit activities).
+2. SageMaker AI → Applications and IDEs → Notebooks → **Create notebook instance**: pick a type from the
+   table; under **Additional configuration set Volume size to 50 GB** (the 5 GB default can't hold the
+   2.5 GB data + cache); platform Amazon Linux 2023 / JupyterLab 4; IAM role: create new, defaults.
+   If it fails with a quota/limit error: Service Quotas → Amazon SageMaker → "`<type>` for notebook
+   instance usage" → request an increase. **Do this early** (approval can take hours); Kaggle is the fallback.
+3. Get the data onto the instance once: upload the organizers' zip to S3 (S3 console upload, 1.1 GB;
+   5 GB of S3 is free), then in a JupyterLab **Terminal**:
+   ```bash
+   cd ~/SageMaker        # the persistent disk — survives stop/start
+   git clone https://<github-token>@github.com/SteganoSage/team-AiseKaise-amlc26.git
+   cd team-AiseKaise-amlc26
+   source activate python3
+   pip install -q -r code/business_entity_resolution/requirements.txt
+   aws s3 cp s3://<your-bucket>/<zip-name>.zip .
+   unzip -q <zip-name>.zip 'student_resource/dataset/*' -x '__MACOSX/*'
+   mv student_resource/dataset dataset && rm -rf student_resource <zip-name>.zip
+   ```
+4. Run in the background so a closed browser tab doesn't kill it:
+   ```bash
+   nohup python code/business_entity_resolution/src/run_pipeline.py --mode test > test.log 2>&1 &
+   tail -f test.log
+   ```
+5. Download `output/matching_results.tsv` from the JupyterLab file browser (right-click → Download)
+   and hand it to the leader for the Unstop upload.
+6. **Stop the notebook instance** when done. We never need endpoints, training jobs or Bedrock.
+   The Bedrock-playground credit activity is fine to click through, but **no AWS AI service
+   (Bedrock, Comprehend, JumpStart models, …) may be called from our pipeline**: models must be
+   MIT/Apache ≤ 8B, and external services for resolving entities are banned.
+
 ## 3. Rules we cannot break (any one = disqualification)
 
 1. **No external data.** No APIs, geocoding, business registries, scraping or extra datasets. Hand-written dictionaries (`rd → road`, `sarl`) are fine.
 2. **Pretrained models must be MIT or Apache-2.0 AND ≤ 8B parameters.** Check the Hugging Face card and add the model to `MODELS.md`.
    - OK: `intfloat/multilingual-e5-small/base`, `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`, `Qwen2.5-7B-Instruct`, `Phi-3.5-mini`.
    - **Not OK:** `Qwen2.5-3B` (Qwen license), any Llama or Gemma, and `Qwen3-8B` (8.19B, just over the limit).
-3. **The repo stays private.** The Kaggle dataset must also be **private**. Never share code or data outside the team.
+3. **The repo stays private.** Any copy of the dataset (S3 bucket, Kaggle dataset) must also be **private**. Never share code or data outside the team.
 4. **Only the team leader logs in to Unstop and uploads**, from one device. Never log in from two devices at once.
 5. **Train countries are US + India; test adds France.** Never hard-code or filter country values, and no country one-hot features.
 
@@ -67,7 +127,12 @@ To import our modules inside a notebook:
   1. `git merge main` so your branch is up to date.
   2. Run `--mode validate`.
   3. Fill in the PR template (it opens automatically) with your numbers and main's numbers.
-- **Merge rule:** compare **current `main` + your idea** against **current `main`**. Your standalone score doesn't count; see the stacking rule in §5. Merge if holdout F0.5 goes up clearly (not +0.001 noise; OOF F0.5 should move the same way) **and** blocking recall does not drop. The other acceptable case is the same score with the code faster or simpler.
+- **Merge rule:** compare **current `main` + your idea** against **current `main`**, with the same
+  `--sample-s1` value. Your standalone score doesn't count; see the stacking rule in §5. Merge if:
+  - holdout F0.5 goes up clearly (not +0.001 noise; OOF F0.5 should move the same way) **and**
+    candidates per S1 does not go up, **or**
+  - candidates per S1 goes down with the same F0.5 (smaller candidate sets rank higher), **or**
+  - same numbers, but the code is faster or simpler.
 - **Do not change** in experiment branches (otherwise scores are not comparable):
   - `RANDOM_SEED`, `VAL_SPLIT_RATIO`, `CV_FOLDS`
   - `evaluate.py`
@@ -119,32 +184,43 @@ The threshold is re-tuned automatically on every run, so a combination never get
 
 ### Idea list
 
-**Day 1, first hour:** three people, three ideas that unblock everything else: **#14** (EDA), **#7** (speed), **#1** (blocking).
+**First real numbers** (20k-S1 slice of real train, easier than full data): holdout F0.5 **0.979**
+(all-empty 0.053 — only ~5% of S1s have no match; ~3.5 true links per S1), candidates per S1
+**4.3** (34.7 before pruning), candidate recall 0.983. **India is the weak spot** (candidate recall
+0.968 vs US 0.992). Full-data numbers come from the first SageMaker run.
 
-| # | Idea | Details | After |
+**Day 1 first moves:** leader → SageMaker notebook instance (§2) + full `--mode test` run for the first
+real upload; one person → #A (full-scale validate on SageMaker, runtime/memory); one person → #2 (read
+`holdout_errors.tsv`, India first).
+
+"Built" = code exists behind a switch in `config.py` — the job is to **measure it on real data**
+(A/B with the switch) and keep or drop it.
+
+| # | Idea | Status | Details |
 |---|---|---|---|
-| 1 | Tune blocking | Measure blocking recall and mean candidates per S1 on real data, then tune `BLOCKING_TOP_K_*` and `BLOCKING_EXACT_KEY_MAX_BLOCK`. Target recall **≥ 0.97** with as few candidates as possible. Blocking sets our ceiling: a true match that isn't shortlisted can never be predicted. | |
-| 2 | Fix what blocking misses | Look at the true pairs no blocker catches, and fix normalization for them (missing abbreviations etc.). | #1 |
-| 3 | Indian spellings | PIN codes written `411 001`, Shri / Sri / Shree, other transliterations. | |
-| 4 | French normalization | `sarl/sas/eurl`, `rue/bd/av/ch`, "St" = saint (French) vs street, accents. Check against the real French test records. | #14 |
-| 5 | Embedding shortlist | kNN search with `intfloat/multilingual-e5-small` (MIT, 118M) on a Kaggle GPU. Helps with transliterations and reordered words. | |
-| 6 | Sound-alike name key | Double Metaphone key as an extra blocker. | |
-| 7 | **Speed up features** | Features are computed in a Python loop, at ~60 µs per pair. Vectorize with `rapidfuzz.process.cpdist(..., workers=-1)`. Makes everyone's experiments faster. | |
-| 8 | Rank features | Each candidate's rank among its S1's candidates, and its score gap to that S1's best candidate. **Likely the biggest gain.** | |
-| 9 | Mutual-best feature | Is this S1 also the candidate's best S1? | |
-| 10 | More similarity features | TF-IDF cosine on name and address; overlap of numbers in the address. | |
-| 11 | Embedding similarity features | Cosine of name/address embeddings. | #5 |
-| 12 | Decision settings | `RESOLVE_CONFLICTS` on/off, `MAX_MATCHES_PER_S1`, separate thresholds for S2 vs S3. | |
-| 13 | LightGBM tuning | Only after the features settle. | Day 2+ |
-| 14 | **EDA notebook** | File sizes; % of S1 with no match; matches per S1 (0 / 1 / 2+); S2 vs S3 split; **exact country strings in every file** ("India" vs "IN" breaks country blocking); what French test records look like; postal-code formats; empty name/address rate. Share findings in the group. | |
-| 15 | Error dump | Write holdout false positives / false negatives (with names + addresses) to a TSV so everyone can see what's failing. | |
-| 16 | Leave-one-country-out check | Train on India, validate on US, then the reverse. Our best stand-in for how the model behaves on France, and whether the threshold holds up. | |
-| 17 | Cross-encoder reranker | `BAAI/bge-reranker-v2-m3` (Apache-2.0, 568M) on the hardest pairs. **Stretch goal, Day 3 only if everything else is done.** | |
+| A | Full-scale run on SageMaker | todo | `--mode validate --sample-s1 200000`, then full. Note runtime + peak RAM per stage. If stage 1 is slow: lower `BLOCKING_MAX_DF`, raise `BLOCKING_CHUNK_ROWS`. |
+| 1 | Tune blocking + pruning size | todo | `BLOCKING_TOP_K`, `BLOCKING_MAX_DF`, `PRUNE_TOP_N`, `PRUNE_MIN_PROB`. Goal: fewest candidates per S1 that doesn't cost F0.5 (both numbers are ranked). |
+| 2 | Fix what we miss | todo | `holdout_errors.tsv`: `FN_not_candidate` rows = blocking/pruning misses, `FN_scored` = model misses, `FP` = false merges. Fix normalization/features for the biggest patterns. **India first.** |
+| 3 | Indian spellings + **Devanagari** | todo | S3 has Hindi-script names/addresses (`मॉडर्न फाइनेंस`). Try transliteration to Latin in `normalize.py`; PIN `411 001`; Shri/Sri/Shree. |
+| 4 | French normalization | todo | `sarl/sas/eurl`, `R.`/`rue`, `AV`, `bd`, "St" = saint vs street, accents. Check against real French test records (`eda.py --split test`). |
+| 5 | Embedding shortlist | built (`--embeddings`) | multilingual-e5-small on a GPU instance (`ml.g4dn.4xlarge`), `pip install -r requirements-embeddings.txt`. Should help Devanagari + reordering. Measure recall gain vs runtime (~12M texts/split). |
+| 6 | Sound-alike / typo blocker | todo | Word TF-IDF misses typos inside rare words. Options: Double Metaphone key, char n-grams restricted to rare tokens. |
+| 7 | ~~Speed up features~~ | done | Vectorized (rapidfuzz `cpdist`, index arrays). |
+| 8 | Rank features | built (`rank`) | Rank / gap to best within the S1's and the candidate's candidates. Ablate with `FEATURE_GROUPS["rank"] = False`. |
+| 9 | Mutual-best feature | built (`rank`) | Part of the rank group. |
+| 10 | More similarity features | built (`tfidf`, `numbers`) | Blocking cosines reused; address-number overlap. |
+| 11 | Embedding similarity features | built (`--embeddings`) | After #5. |
+| 12 | Decision settings | built (switches) | `RESOLVE_CONFLICTS`, `MAX_MATCHES_PER_S1`, `PER_SOURCE_THRESHOLD`. |
+| 13 | LightGBM tuning | todo, Day 2+ | Only after the features settle. Pruner params too (`PRUNER_PARAMS`). |
+| 14 | ~~EDA~~ | done | `src/eda.py`; real-data facts in CLAUDE.md §2. |
+| 15 | ~~Error dump~~ | done | `models/holdout_errors.tsv` after every validate run. |
+| 16 | Leave-one-country-out | built (`--mode loco`) | Run it on SageMaker; tells us how far the threshold drifts on an unseen country (France risk). |
+| 17 | Cross-encoder reranker | todo, stretch | `BAAI/bge-reranker-v2-m3` (Apache-2.0, 568M) on the hardest pairs. Day 3 only if everything else is done. |
 
 New ideas are welcome. Open an issue for them first.
 
 ### Leader-only jobs
-- **Day 1, first thing:** upload the dataset to Kaggle as a **private** dataset and add teammates as collaborators.
+- **Day 1, first thing:** set up the SageMaker notebook instance + data (§2); share the private S3 copy or Kaggle dataset with teammates.
 - Merge PRs at the two daily syncs, one at a time (stacking rule).
 - All leaderboard uploads (§7) and `submissions/LOG.md`.
 - Documentation (with blocking recall + reduction ratio numbers), `MODELS.md`, and the final zip.
@@ -153,7 +229,7 @@ New ideas are welcome. Open an issue for them first.
 
 | When | Goal | Uploads |
 |---|---|---|
-| **Day 1 — 25 Sep** | Data in → baseline running on real data → first real numbers (recall, holdout F0.5, runtime). First ideas: #14 EDA (shared by noon), #7 speed, #1 blocking. Syncs ~13:00 and ~21:00. | #1 all-empty file (public score ≈ share of no-match S1s; tells us if test looks like train). #2 baseline. #3–#5 after improvements are merged. |
+| **Day 1 — 25 Sep** | Data in → pipeline rebuilt for 12M records → first full SageMaker run → first real upload. Then #A, #1, #2. Syncs ~13:00 and ~21:00. | #1 all-empty file (expect ≈ 0.05: only ~5% of S1s have no match — tells us if test looks like train). #2 baseline. #3–#5 after improvements are merged. |
 | **Day 2 — 26 Sep** | Group features, embeddings, French normalization, leave-one-country-out check, error analysis. | Up to 5, spread through the day, each one = `main` after an improving merge. |
 | **Day 3 — 27 Sep** | **No new ideas after 18:00 IST.** Final model, documentation, MODELS.md, zip, full rerun from a fresh clone to prove it reproduces. | Keep 1–2 for the final model. **Last upload by ~21:00 IST**, not 23:50. |
 
@@ -173,11 +249,17 @@ New ideas are welcome. Open an issue for them first.
    git tag sub-d1-2
    git push && git push --tags
    ```
-6. Upload on Unstop, then add the public LB score to `LOG.md` and commit.
+6. Upload **only `matching_results.tsv`** on the portal; it must show status `SCORED`. Then add the
+   public LB score to `LOG.md` and commit.
+
+**Final zip (once, Day 3):** `AiseKaise_submission.zip` = `output/` (both TSVs of the chosen run) +
+`code/business_entity_resolution/` (`src/`, `README.md`, `requirements.txt`, `MODELS.md`) +
+filled-in `Documentation_template.md` (`.md` or `.pdf`). No `dataset/`, `models/`, notebooks or
+submissions. Rerun it from a fresh clone first — organizers will reproduce it and audit
+`candidate_pairs.tsv` (smaller candidate sets rank higher).
 
 ## 8. Still to confirm (guidelines / live demo)
 
 - Which upload counts for the final private leaderboard: the last one, the best one, or one we choose?
 - When does the 5-per-day counter reset (midnight IST)?
-- When exactly is the dataset released, and how big is the test set?
-- The final zip format and deadline for the code + documentation package.
+- Deadline and upload place for the final zip.
