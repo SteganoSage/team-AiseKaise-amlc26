@@ -71,7 +71,7 @@ def pruner_features(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFrame,
         if c.startswith(("score_", "rank_")) or c == "is_s2":
             cols[c] = pairs[c].to_numpy(dtype=np.float32)
     cols["n_blockers"] = np.array(
-        [bin(m).count("1") for m in range(8)], dtype=np.float32)[pairs["blockers"].to_numpy()]
+        [bin(m).count("1") for m in range(16)], dtype=np.float32)[pairs["blockers"].to_numpy()]
 
     s1_rows, tgt_rows = pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy()
     for name, *_ in PRUNER_STRING_FEATURES:

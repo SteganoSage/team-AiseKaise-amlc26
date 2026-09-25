@@ -450,6 +450,7 @@ def save_run_info(mode: str, info: dict) -> None:
     info = {"mode": mode, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "use_embeddings": config.USE_EMBEDDINGS,
             "snap_to_reference": config.SNAP_TO_REFERENCE,
+            "top1_threshold": config.TOP1_THRESHOLD,
             "feature_groups": config.FEATURE_GROUPS,
             "blocking_top_k": config.BLOCKING_TOP_K,
             "blocking_max_df": config.BLOCKING_MAX_DF,

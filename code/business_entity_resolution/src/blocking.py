@@ -6,7 +6,10 @@ source (S2, S3) separately, inside the same country:
 
 1. "name" blocker:     TF-IDF on word 1-2 grams of name_core → top-K
 2. "combined" blocker: TF-IDF on word 1-2 grams of name + address → top-K
-3. (optional) "embedding" blocker: multilingual sentence-embedding kNN (GPU)
+3. (optional) "address" blocker: TF-IDF on word 1-2 grams of the address only,
+   so a record whose name is garbled (typos, other script, website form) is
+   still found through a rare house number + street ("8806 alki")
+4. (optional) "embedding" blocker: multilingual sentence-embedding kNN (GPU)
 
 How it scales:
 - HashingVectorizer: no vocabulary to hold in memory (word pairs over
@@ -37,7 +40,7 @@ from sklearn.preprocessing import normalize as l2_normalize
 import config
 
 # Bit flags recording which blocker(s) produced a candidate pair
-BLOCKER_BITS = {"name": 1, "combined": 2, "embedding": 4}
+BLOCKER_BITS = {"name": 1, "combined": 2, "embedding": 4, "address": 8}
 
 # Worker-process globals for the sparse top-K (inherited through fork)
 _SHARED = {}
@@ -53,7 +56,7 @@ def blocker_texts(frame: pd.DataFrame, blocker: str) -> list:
 
     Args:
         frame: Normalized records (normalize.normalize_frame output).
-        blocker: "name" or "combined".
+        blocker: "name", "combined" or "address".
 
     Returns:
         List of strings, one per record.
@@ -62,6 +65,8 @@ def blocker_texts(frame: pd.DataFrame, blocker: str) -> list:
         return frame["name_core"].tolist()
     if blocker == "combined":
         return (frame["name_norm"] + " " + frame["address_norm"]).tolist()
+    if blocker == "address":
+        return frame["address_norm"].tolist()
     raise ValueError(f"Unknown blocker {blocker}")
 
 
@@ -352,6 +357,8 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
 
     matrices, found = {}, []
     for blocker, k in config.BLOCKING_TOP_K.items():
+        if not k:
+            continue  # blocker switched off (top-K 0)
         t0 = time.time()
         Q, T = tfidf_pair(blocker_texts(s1, blocker), blocker_texts(tgt, blocker), n_jobs)
         t1 = time.time()
@@ -529,7 +536,7 @@ def report_recall(pairs: pd.DataFrame, labels: np.ndarray, n_true_links: int,
             print(f"  {'blocker':>12s}  {'recall':>7s}  {'only this':>9s}")
             for name, bit in BLOCKER_BITS.items():
                 hit = (mask & bit) > 0
-                if hit.any() or name != "embedding":
+                if hit.any() or config.BLOCKING_TOP_K.get(name):
                     print(f"  {name:>12s}  {hit.sum() / n_true_links:>7.4f}  "
                           f"{int((mask == bit).sum()):>9d}")
     return recall

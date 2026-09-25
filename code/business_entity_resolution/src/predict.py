@@ -9,7 +9,8 @@ the output we actually submit.
 
 Decision rule:
 1. Keep pairs with probability ≥ threshold (one shared threshold, or one
-   per source when config.PER_SOURCE_THRESHOLD is on).
+   per source when config.PER_SOURCE_THRESHOLD is on; each S1's best
+   candidate gets its own "top1" threshold when config.TOP1_THRESHOLD is on).
 2. One-to-one assignment: an S2/S3 record goes to at most one S1 (the
    highest-scoring one), since S1 is deduplicated.
 3. Optional per-S1 top-N cap.
@@ -42,10 +43,10 @@ def predict_scores(model, X: np.ndarray) -> np.ndarray:
 
 def format_threshold(threshold) -> str:
     """
-    Human-readable threshold: "0.870" or "S2 0.850 / S3 0.910".
+    Human-readable threshold: "0.870" or "S2 0.850 / S3 0.910 / top1 0.600".
 
     Args:
-        threshold: Float, or dict {"S2": float, "S3": float}.
+        threshold: Float, or dict with "S2"/"S3" or "base", and optionally "top1".
 
     Returns:
         Formatted string.
@@ -55,20 +56,28 @@ def format_threshold(threshold) -> str:
     return f"{threshold:.3f}"
 
 
-def pair_thresholds(is_s2: np.ndarray, threshold):
+def pair_thresholds(is_s2: np.ndarray, threshold, is_top1: np.ndarray = None):
     """
     Resolve the threshold that applies to each pair.
 
     Args:
         is_s2: 1 for S2 candidates, 0 for S3.
-        threshold: Float (same for all pairs), or dict {"S2": t, "S3": t}.
+        threshold: Float (same for all pairs), or dict with {"S2": t, "S3": t}
+            or {"base": t}, plus optionally {"top1": t} for each S1's best pair.
+        is_top1: True for the best-scoring pair of its S1 (needed for "top1").
 
     Returns:
         The float itself, or an array with one threshold per pair.
     """
-    if isinstance(threshold, dict):
-        return np.where(is_s2 == 1, threshold["S2"], threshold["S3"])
-    return threshold
+    if not isinstance(threshold, dict):
+        return threshold
+    if "S2" in threshold:
+        per_pair = np.where(is_s2 == 1, threshold["S2"], threshold["S3"])
+    else:
+        per_pair = np.full(len(is_s2), threshold["base"])
+    if "top1" in threshold and is_top1 is not None:
+        per_pair = np.where(is_top1, threshold["top1"], per_pair)
+    return per_pair
 
 
 def decide(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
@@ -98,7 +107,10 @@ def decide(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
     if max_per_s1 is None:
         max_per_s1 = config.MAX_MATCHES_PER_S1
 
-    keep = np.flatnonzero(scores >= pair_thresholds(is_s2, threshold))
+    is_top1 = None
+    if isinstance(threshold, dict) and "top1" in threshold:
+        is_top1 = group_rank(s1_idx, scores) == 1
+    keep = np.flatnonzero(scores >= pair_thresholds(is_s2, threshold, is_top1))
     if resolve_conflicts and len(keep):
         order = keep[np.argsort(-scores[keep], kind="stable")]
         _, first = np.unique(tgt_idx[order], return_index=True)
@@ -198,6 +210,22 @@ def tune_threshold(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
         best_threshold = best
         if verbose:
             print(f"  → Per-source thresholds: {format_threshold(best)} "
+                  f"(F0.5 = {best_f05:.4f})")
+
+    if config.TOP1_THRESHOLD:
+        # Own threshold for each S1's best candidate; then re-check the others
+        best = dict(best_threshold) if isinstance(best_threshold, dict) \
+            else {"base": best_threshold}
+        best["top1"] = best.get("S2", best.get("base"))
+        for key in ("top1", *[k for k in best if k != "top1"], "top1"):
+            for t in thresholds:
+                trial = {**best, key: float(t)}
+                f05 = score(trial)[0]
+                if f05 > best_f05:
+                    best, best_f05 = trial, f05
+        best_threshold = best
+        if verbose:
+            print(f"  → With top-1 threshold: {format_threshold(best)} "
                   f"(F0.5 = {best_f05:.4f})")
 
     return best_threshold, best_f05

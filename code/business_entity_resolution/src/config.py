@@ -114,8 +114,10 @@ SNAP_TO_REFERENCE = True
 # Hashed TF-IDF over word 1-2 grams, per source, searched per country:
 #   "name":     name_core
 #   "combined": name_norm + address_norm
+#   "address":  address_norm only (finds records whose name is garbled but
+#               whose house number + street match; 0 = off)
 # Top-K per blocker per source per S1 entity.
-BLOCKING_TOP_K = {"name": 10, "combined": 10}
+BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 0}
 BLOCKING_TOP_K_EMBEDDING = 10
 
 # Terms (words or word pairs) found in more than this many S2/S3 records of
@@ -247,6 +249,12 @@ MAX_MATCHES_PER_S1 = None
 # Tune separate thresholds for S2 and S3 candidates (coordinate search
 # starting from the best single threshold) instead of one shared threshold.
 PER_SOURCE_THRESHOLD = False
+
+# Tune a separate threshold for the best-scoring candidate of each S1 ("top1")
+# on top of the shared one. For the top candidate, predicting nothing costs as
+# much as a wrong match (both score 0), while every extra match only moves
+# precision/recall a little, so the best cutoffs usually differ.
+TOP1_THRESHOLD = False
 
 # ──────────────────────────────────────────────────────────────────────
 # Diagnostics

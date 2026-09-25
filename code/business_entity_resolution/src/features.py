@@ -303,7 +303,7 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
     if groups.get("blockers", True):
         mask = pairs["blockers"].to_numpy()
         for name, bit in BLOCKER_BITS.items():
-            if name != "embedding" or config.USE_EMBEDDINGS:
+            if config.BLOCKING_TOP_K.get(name) or (name == "embedding" and config.USE_EMBEDDINGS):
                 cols[f"found_by_{name}"] = ((mask & bit) > 0).astype(np.float32)
 
     if groups.get("pruner", True) and "pruner_prob" in pairs:
