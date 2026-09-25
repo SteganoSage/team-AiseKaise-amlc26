@@ -21,7 +21,8 @@ normalize (parallel, cached)
   `candidate_pairs.tsv` is per S1 — smaller candidate sets rank higher in the final evaluation.
   Every run prints both, plus candidate recall after each stage.
 - Runs end to end on fake data and on a small slice of the real train data; the output passes the
-  organizers' validator. **Full-size runs need ~30 GB RAM** → an AWS SageMaker notebook instance paid from our credits (§2), Kaggle as fallback. A laptop can't hold 12M records.
+  organizers' validator. **Full-size runs need ~20-30 GB RAM → Kaggle** (free CPU session: 30 GB, 4 cores) with
+  `notebooks/00_run_pipeline_kaggle.ipynb` (§2). A laptop or free Colab (~12 GB) can't hold the ~10M S2/S3 records.
 - `--mode validate` → local score on a 20% holdout of train S1s (use `--sample-s1 200000` for quick runs).
 - `--mode loco` → leave one country out (train on India, test on US and vice versa) = our France check.
 - `--mode test` → writes `output/matching_results.tsv` + `output/candidate_pairs.tsv` and runs the validator.
@@ -39,8 +40,12 @@ The dataset goes in `dataset/train/` and `dataset/test/` (unzip the organizers' 
 `student_resource/dataset/*` there). Git ignores that folder, so it is never committed.
 `make_test_data.py` writes fake data to `dataset_fake/` and never touches `dataset/`.
 
-**Kaggle** (fallback for full runs if SageMaker isn't set up; turn Internet ON; GPU only for `--embeddings`). Upload the
-`dataset/` folder (train + test TSVs, 2.5 GB) once as a **private** Kaggle dataset.
+**Kaggle — where all full runs happen** (free CPU session: ~30 GB RAM, 4 cores, up to 12 h).
+Easiest: import **`notebooks/00_run_pipeline_kaggle.ipynb`** (File → Import Notebook), set `BRANCH` / `MODE` in the
+first cell, and for long runs use **Save Version → Save & Run All** (keeps running with the browser closed).
+One-time: upload the organizers' zip as a **private** Kaggle dataset (kaggle.com/datasets → New Dataset;
+the notebook finds the files wherever Kaggle unpacks them), add it via *Add Input*, turn *Internet* on,
+and add a *Secret* `GITHUB_TOKEN` (GitHub token that can read this private repo). Manual version:
 ```python
 # One-time: add a GitHub token (read-only, this repo only) as a Kaggle Secret named GITHUB_TOKEN
 from kaggle_secrets import UserSecretsClient
@@ -54,7 +59,11 @@ token = UserSecretsClient().get_secret("GITHUB_TOKEN")
 To import our modules inside a notebook:
 `sys.path.insert(0, ".../code/business_entity_resolution/src")`. Put it at **position 0**, because our `evaluate.py` has the same name as a preinstalled Kaggle package.
 
-**AWS SageMaker** (recommended for full runs; paid from the **$200 AWS credits each participant gets**:
+**Colab:** free tier (~12 GB RAM) is too small for the real data — only for code tests on fake data
+(`USE_FAKE_DATA = True` in the same notebook).
+
+**AWS SageMaker (optional, not needed)** — needs a separate AWS account (not the Builder ID) with a card;
+paid from the **$200 AWS credits each participant gets**:
 $100 at signup + 5 × $20 console activities). From the organizers' prep guide (Jatin Mehrotra, AWS).
 
 The free tier is too small for our data: the free notebook `ml.t3.medium` has 2 vCPU / **4 GB RAM**,
@@ -77,7 +86,7 @@ One-time setup (in **us-east-1**, as the guide recommends):
    table; under **Additional configuration set Volume size to 50 GB** (the 5 GB default can't hold the
    2.5 GB data + cache); platform Amazon Linux 2023 / JupyterLab 4; IAM role: create new, defaults.
    If it fails with a quota/limit error: Service Quotas → Amazon SageMaker → "`<type>` for notebook
-   instance usage" → request an increase. **Do this early** (approval can take hours); Kaggle is the fallback.
+   instance usage" → request an increase (approval can take hours).
 3. Get the data onto the instance once: upload the organizers' zip to S3 (S3 console upload, 1.1 GB;
    5 GB of S3 is free), then in a JupyterLab **Terminal**:
    ```bash
@@ -187,10 +196,10 @@ The threshold is re-tuned automatically on every run, so a combination never get
 **First real numbers** (20k-S1 slice of real train, easier than full data): holdout F0.5 **0.979**
 (all-empty 0.053 — only ~5% of S1s have no match; ~3.5 true links per S1), candidates per S1
 **4.3** (34.7 before pruning), candidate recall 0.983. **India is the weak spot** (candidate recall
-0.968 vs US 0.992). Full-data numbers come from the first SageMaker run.
+0.968 vs US 0.992). Full-data numbers come from the first Kaggle run.
 
-**Day 1 first moves:** leader → SageMaker notebook instance (§2) + full `--mode test` run for the first
-real upload; one person → #A (full-scale validate on SageMaker, runtime/memory); one person → #2 (read
+**Day 1 first moves:** leader → private Kaggle dataset + `00_run_pipeline_kaggle.ipynb` with `MODE="test"`
+(Save & Run All) for the first real upload; one person → #A (full-scale validate on Kaggle, runtime/memory); one person → #2 (read
 `holdout_errors.tsv`, India first).
 
 "Built" = code exists behind a switch in `config.py` — the job is to **measure it on real data**
@@ -198,12 +207,12 @@ real upload; one person → #A (full-scale validate on SageMaker, runtime/memory
 
 | # | Idea | Status | Details |
 |---|---|---|---|
-| A | Full-scale run on SageMaker | todo | `--mode validate --sample-s1 200000`, then full. Note runtime + peak RAM per stage. If stage 1 is slow: lower `BLOCKING_MAX_DF`, raise `BLOCKING_CHUNK_ROWS`. |
+| A | Full-scale run on Kaggle | todo | `--mode validate --sample-s1 200000`, then full. Note runtime + peak RAM per stage. If stage 1 is slow: lower `BLOCKING_MAX_DF`, raise `BLOCKING_CHUNK_ROWS`. |
 | 1 | Tune blocking + pruning size | todo | `BLOCKING_TOP_K`, `BLOCKING_MAX_DF`, `PRUNE_TOP_N`, `PRUNE_MIN_PROB`. Goal: fewest candidates per S1 that doesn't cost F0.5 (both numbers are ranked). |
 | 2 | Fix what we miss | todo | `holdout_errors.tsv`: `FN_not_candidate` rows = blocking/pruning misses, `FN_scored` = model misses, `FP` = false merges. Fix normalization/features for the biggest patterns. **India first.** |
 | 3 | Indian spellings + **Devanagari** | todo | S3 has Hindi-script names/addresses (`मॉडर्न फाइनेंस`). Try transliteration to Latin in `normalize.py`; PIN `411 001`; Shri/Sri/Shree. |
 | 4 | French normalization | todo | `sarl/sas/eurl`, `R.`/`rue`, `AV`, `bd`, "St" = saint vs street, accents. Check against real French test records (`eda.py --split test`). |
-| 5 | Embedding shortlist | built (`--embeddings`) | multilingual-e5-small on a GPU instance (`ml.g4dn.4xlarge`), `pip install -r requirements-embeddings.txt`. Should help Devanagari + reordering. Measure recall gain vs runtime (~12M texts/split). |
+| 5 | Embedding shortlist | built (`--embeddings`) | multilingual-e5-small on a Kaggle GPU session (`EMBEDDINGS = True` in the notebook). Should help Devanagari + reordering. Measure recall gain vs runtime (~12M texts/split). |
 | 6 | Sound-alike / typo blocker | todo | Word TF-IDF misses typos inside rare words. Options: Double Metaphone key, char n-grams restricted to rare tokens. |
 | 7 | ~~Speed up features~~ | done | Vectorized (rapidfuzz `cpdist`, index arrays). |
 | 8 | Rank features | built (`rank`) | Rank / gap to best within the S1's and the candidate's candidates. Ablate with `FEATURE_GROUPS["rank"] = False`. |
@@ -214,13 +223,13 @@ real upload; one person → #A (full-scale validate on SageMaker, runtime/memory
 | 13 | LightGBM tuning | todo, Day 2+ | Only after the features settle. Pruner params too (`PRUNER_PARAMS`). |
 | 14 | ~~EDA~~ | done | `src/eda.py`; real-data facts in CLAUDE.md §2. |
 | 15 | ~~Error dump~~ | done | `models/holdout_errors.tsv` after every validate run. |
-| 16 | Leave-one-country-out | built (`--mode loco`) | Run it on SageMaker; tells us how far the threshold drifts on an unseen country (France risk). |
+| 16 | Leave-one-country-out | built (`--mode loco`) | Run it on Kaggle; tells us how far the threshold drifts on an unseen country (France risk). |
 | 17 | Cross-encoder reranker | todo, stretch | `BAAI/bge-reranker-v2-m3` (Apache-2.0, 568M) on the hardest pairs. Day 3 only if everything else is done. |
 
 New ideas are welcome. Open an issue for them first.
 
 ### Leader-only jobs
-- **Day 1, first thing:** set up the SageMaker notebook instance + data (§2); share the private S3 copy or Kaggle dataset with teammates.
+- **Day 1, first thing:** upload the dataset to Kaggle as a **private** dataset and add teammates as collaborators (§2).
 - Merge PRs at the two daily syncs, one at a time (stacking rule).
 - All leaderboard uploads (§7) and `submissions/LOG.md`.
 - Documentation (with blocking recall + reduction ratio numbers), `MODELS.md`, and the final zip.
@@ -229,7 +238,7 @@ New ideas are welcome. Open an issue for them first.
 
 | When | Goal | Uploads |
 |---|---|---|
-| **Day 1 — 25 Sep** | Data in → pipeline rebuilt for 12M records → first full SageMaker run → first real upload. Then #A, #1, #2. Syncs ~13:00 and ~21:00. | #1 all-empty file (expect ≈ 0.05: only ~5% of S1s have no match — tells us if test looks like train). #2 baseline. #3–#5 after improvements are merged. |
+| **Day 1 — 25 Sep** | Data in → pipeline rebuilt for 12M records → first full Kaggle run → first real upload. Then #A, #1, #2. Syncs ~13:00 and ~21:00. | #1 all-empty file (expect ≈ 0.05: only ~5% of S1s have no match — tells us if test looks like train). #2 baseline. #3–#5 after improvements are merged. |
 | **Day 2 — 26 Sep** | Group features, embeddings, French normalization, leave-one-country-out check, error analysis. | Up to 5, spread through the day, each one = `main` after an improving merge. |
 | **Day 3 — 27 Sep** | **No new ideas after 18:00 IST.** Final model, documentation, MODELS.md, zip, full rerun from a fresh clone to prove it reproduces. | Keep 1–2 for the final model. **Last upload by ~21:00 IST**, not 23:50. |
 
