@@ -43,6 +43,8 @@ The dataset goes in `dataset/train/` and `dataset/test/` (unzip the organizers' 
 **Kaggle — where all full runs happen** (free CPU session: ~30 GB RAM, 4 cores, up to 12 h).
 Easiest: import **`notebooks/00_run_pipeline_kaggle.ipynb`** (File → Import Notebook), set `BRANCH` / `MODE` in the
 first cell, and for long runs use **Save Version → Save & Run All** (keeps running with the browser closed).
+Test runs end with `submission_<branch>_<commit>.zip` in the version's Output tab: download that (a bare `.tsv`
+opens as text in a storage.googleapis.com tab), unzip, and upload `matching_results.tsv`.
 One-time: upload the organizers' zip as a **private** Kaggle dataset (kaggle.com/datasets → New Dataset;
 the notebook finds the files wherever Kaggle unpacks them), add it via *Add Input*, turn *Internet* on,
 and add a *Secret* `GITHUB_TOKEN` (GitHub token that can read this private repo). Manual version:
