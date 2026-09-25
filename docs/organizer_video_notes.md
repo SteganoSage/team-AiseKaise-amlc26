@@ -11,7 +11,7 @@ These are notes from the official intro video. It matches `CLAUDE.md`; nothing i
      `S1-732914 Acme Robotics Inc, 500 Market St, San Jose` → candidates
      `S2-118820 Acme Robotics Inc` (match), `S2-540221 Acme Robotix, 12 Elm Rd` (look-alike),
      `S3-905477 Acme Robotics, Nr City Hall` (match), `S3-063118 Acme Bakery, 500 Market St` (same address, different business).
-     This candidate list is what goes into `candidate_pairs.tsv`.
+     This candidate list is what goes into `candidate_pairs.tsv` (portal update 25 Sep: smaller candidate sets per S1 rank higher in the final evaluation, see CLAUDE.md §4).
    - **Matching model:** filters the candidates and keeps only the true matches →
      `matching_results.tsv` (`S1-732914 → S2-118820, S3-905477`), one row per S1 entity. This file is the one the leaderboard scores.
 3. **Dataset.** Train has all 3 sources + `train_ground_truth.tsv` (one row per S1, comma-separated
