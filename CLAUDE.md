@@ -326,8 +326,8 @@ handling unseen country France, models used + licenses). No page limit — clari
 - Team size 3. Only the **team leader** submits on Unstop.
 - Work is split by idea, not by file: see PLAN.md §5 (shared idea list, twice-daily merges, stacking rule —
   every merge is re-validated on top of the current `main`). Leader = merges, submissions, repo, documentation.
-- Compute: **AWS SageMaker notebook instances paid from the $200 AWS credits every participant gets**
-  (free-tier `ml.t3.medium` = 4 GB RAM is too small for the full data; use `ml.r5.2xlarge` /
-  `ml.m5.4xlarge` with a 50 GB volume, us-east-1, stop when idle — setup in PLAN.md §2). Kaggle as
-  fallback. Compute is fine; AWS AI services (Bedrock, Comprehend, …) must never be called from the
+- Compute: **Kaggle CPU sessions (~30 GB RAM, 4 cores) for every full run**, via
+  `notebooks/00_run_pipeline_kaggle.ipynb` (PLAN.md §2). Free Colab (~12 GB) and the laptop only for
+  fake-data / tiny-slice tests. AWS SageMaker is optional (needs a separate AWS account + card; $200
+  credits). Compute is fine; AWS AI services (Bedrock, Comprehend, …) must never be called from the
   pipeline (license + no external entity-resolution services).
