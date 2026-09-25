@@ -95,6 +95,12 @@ SAMPLE_S1 = None
 # reused until the raw file or normalize.py changes.
 USE_NORMALIZE_CACHE = True
 
+# Rewrite S2/S3 names/addresses written in Indic scripts (after
+# transliteration) and website-style names ("anilandevelopers.com") in the
+# words of the same split's S1 (normalize.snap_to_reference). ~49% of the
+# India true matches that blocking missed had an Indic-script name.
+SNAP_TO_REFERENCE = True
+
 # ──────────────────────────────────────────────────────────────────────
 # Stage 1 — blocking (broad, cheap, high recall)
 # ──────────────────────────────────────────────────────────────────────

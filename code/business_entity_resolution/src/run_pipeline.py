@@ -149,6 +149,9 @@ def load_split(split: str, sample_s1: int = None, verbose: bool = True) -> dict:
     tgt = pd.concat([s2.assign(source="S2"), s3.assign(source="S3")], ignore_index=True)
     del s2, s3
     gc.collect()
+    if config.SNAP_TO_REFERENCE:
+        # Uses all S1 records (before sampling) as the vocabulary
+        tgt = normalize.snap_to_reference(tgt, s1, verbose)
 
     if sample_s1 and sample_s1 < len(s1):
         rows = np.sort(np.random.default_rng(config.RANDOM_SEED)
@@ -446,6 +449,7 @@ def save_run_info(mode: str, info: dict) -> None:
     path = os.path.join(config.MODEL_DIR, f"run_info_{mode}.json")
     info = {"mode": mode, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "use_embeddings": config.USE_EMBEDDINGS,
+            "snap_to_reference": config.SNAP_TO_REFERENCE,
             "feature_groups": config.FEATURE_GROUPS,
             "blocking_top_k": config.BLOCKING_TOP_K,
             "blocking_max_df": config.BLOCKING_MAX_DF,
