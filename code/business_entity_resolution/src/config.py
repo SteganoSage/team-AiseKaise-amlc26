@@ -220,8 +220,9 @@ FEATURE_GROUPS = {
     "char_ngram": True, # character 3-gram cosine of name_core (typos)
     # Similarity of a candidate to the OTHER candidates of the same S1 (true
     # matches of one business resemble each other; look-alikes do not), weighted
-    # by pruner probability. Not yet measured (base: llm-advice 27ad884 = 0.9633).
-    "sibling": True,
+    # by pruner probability. 100k validate on bb149a3: 0.9633 -> 0.9635 (neutral;
+    # the model uses them but they overlap with frequency/cross). Off.
+    "sibling": False,
 }
 
 # Pairs per chunk when computing features / cosines (memory bound)
