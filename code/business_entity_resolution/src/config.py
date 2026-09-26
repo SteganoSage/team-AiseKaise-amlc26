@@ -149,6 +149,8 @@ BLOCK_BY_COUNTRY = True
 
 # Sweep on 100k validate (7078791): 10/0.01 → F0.5 0.9562, 5.95 cands/S1;
 # 8/0.03 → 0.9559, 4.92 cands/S1 (-17%). Fewer than ~7 per S1 costs F0.5.
+# Confirmed by a real 100k validate on e6d2766: holdout 0.9559, OOF 0.9556,
+# 4.92 cands/S1, India 0.9463 / US 0.9624.
 PRUNE_TOP_N = 8           # keep at most this many candidates per S1 (both sources)
 PRUNE_MIN_PROB = 0.03     # ...and only those with pruner probability ≥ this
 
