@@ -211,6 +211,13 @@ FEATURE_GROUPS = {
     "blockers": True,   # which blockers produced the pair
     "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)
+    # Ideas from the record-linkage literature (Fellegi-Sunter, Ditto/DeepMatcher
+    # feature lists), not yet measured on a real validate:
+    "frequency": True,  # how many S1 / S2+S3 records share the name / address
+                        # (whole split, before S1 sampling)
+    "cross": True,      # name × address product / min / max, exact flags,
+                        # first / last name word equal
+    "char_ngram": True, # character 3-gram cosine of name_core (typos)
 }
 
 # Pairs per chunk when computing features / cosines (memory bound)

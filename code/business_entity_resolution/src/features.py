@@ -19,17 +19,27 @@ on/off in config.FEATURE_GROUPS for ablations:
 - blockers:  which blockers proposed the pair.
 - pruner:    stage-2 pruner probability.
 - embedding: embedding cosines (only when USE_EMBEDDINGS).
+- frequency: how many S1 / S2+S3 records share the S1's and the candidate's
+             name_core and address (Fellegi-Sunter style: agreeing on a name
+             90 S1 records share is weak evidence), counted over the whole
+             split before any S1 sampling (add_frequency_columns).
+- cross:     name × address interactions (product, min, max), exact name /
+             address flags, first / last name word equal.
+- char_ngram: character 3-gram cosine of name_core (typo tolerant).
 
 All features are country-agnostic (no one-hot country) so France generalizes.
 """
+
+import time
 
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
+from sklearn.feature_extraction.text import HashingVectorizer
 
 import config
-from blocking import BLOCKER_BITS, group_rank, rowwise_cosine
+from blocking import BLOCKER_BITS, _pool, group_rank, rowwise_cosine
 from prune import take_strings
 
 
@@ -117,6 +127,71 @@ def number_overlaps(left: list, right: list) -> dict:
     }
 
 
+def edge_word_matches(left: list, right: list) -> dict:
+    """
+    Whether the first / last words of two names are equal.
+
+    Args:
+        left: S1-side name_core strings, one per pair.
+        right: Candidate-side name_core strings.
+
+    Returns:
+        Dict with name_first_word_equal and name_last_word_equal (0/1).
+    """
+    first = np.fromiter((bool(a) and bool(b) and a.split(" ", 1)[0] == b.split(" ", 1)[0]
+                         for a, b in zip(left, right)), dtype=np.float32, count=len(left))
+    last = np.fromiter((bool(a) and bool(b) and a.rsplit(" ", 1)[-1] == b.rsplit(" ", 1)[-1]
+                        for a, b in zip(left, right)), dtype=np.float32, count=len(left))
+    return {"name_first_word_equal": first, "name_last_word_equal": last}
+
+
+# Character 3-grams inside word boundaries, hashed (no vocabulary to hold)
+CHAR_NGRAM_VECTORIZER = HashingVectorizer(
+    analyzer="char_wb", ngram_range=(3, 3), n_features=2 ** 20,
+    alternate_sign=False, norm="l2", lowercase=False, dtype=np.float32)
+
+
+def _char_cosine_task(texts: tuple) -> np.ndarray:
+    """
+    Character 3-gram cosine of aligned string lists (worker task).
+
+    Args:
+        texts: Tuple (left strings, right strings).
+
+    Returns:
+        Cosine per pair in [0, 1] (0 when either string is empty).
+    """
+    left, right = texts
+    a = CHAR_NGRAM_VECTORIZER.transform(left)
+    b = CHAR_NGRAM_VECTORIZER.transform(right)
+    return np.asarray(a.multiply(b).sum(axis=1), dtype=np.float32).ravel()
+
+
+def char_ngram_cosine(left: list, right: list, task_size: int = 100_000) -> np.ndarray:
+    """
+    Character 3-gram cosine for many pairs, split over worker processes.
+
+    Catches typos that break whole words ("cornerstone trasit" vs
+    "cornerstone transit"), which word-level scores miss.
+
+    Args:
+        left: S1-side strings, one per pair.
+        right: Candidate-side strings.
+        task_size: Pairs per worker task.
+
+    Returns:
+        Cosine per pair.
+    """
+    tasks = [(left[i:i + task_size], right[i:i + task_size])
+             for i in range(0, len(left), task_size)]
+    if config.N_JOBS > 1 and len(tasks) > 1:
+        with _pool(min(config.N_JOBS, len(tasks))) as pool:
+            parts = pool.map(_char_cosine_task, tasks)
+    else:
+        parts = [_char_cosine_task(t) for t in tasks]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+
+
 def structure_features(get) -> dict:
     """
     Postal code, house number, country, length, missing-field features.
@@ -202,12 +277,110 @@ def chunk_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_rows: np.ndarray,
         cols.update(number_overlaps(get("s1", "address_numbers"), get("cand", "address_numbers")))
     if groups.get("structure", True):
         cols.update(structure_features(get))
+    if groups.get("cross", True):
+        cols.update(edge_word_matches(get("s1", "name_core"), get("cand", "name_core")))
+    if groups.get("char_ngram", True):
+        cols["name_char3_cosine"] = char_ngram_cosine(get("s1", "name_core"),
+                                                      get("cand", "name_core"))
     return cols
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Whole-candidate-set features
 # ──────────────────────────────────────────────────────────────────────
+
+# Fields whose frequency is counted: feature key → normalized column
+FREQUENCY_FIELDS = {"name": "name_core", "addr": "address_norm"}
+
+
+def add_frequency_columns(s1: pd.DataFrame, tgt: pd.DataFrame, verbose: bool = True) -> None:
+    """
+    Count how common each record's name and address are in the whole split.
+
+    Fellegi-Sunter record linkage weights agreement by frequency: sharing a
+    name that 90 S1 records have ("fresh hair studio") says little, sharing a
+    unique one says a lot; the same for an office-building address that
+    hosts dozens of businesses. Call this before sampling S1, so a record gets
+    the same counts in training (sampled S1) and at test time (all S1).
+
+    Adds int32 columns <key>_n_s1 (S1 records with the same value) and
+    <key>_n_tgt (S2+S3 records with the same value) to both frames, in place,
+    for every key of FREQUENCY_FIELDS. Empty values get 0.
+
+    Args:
+        s1: Normalized S1 frame (all records of the split).
+        tgt: Normalized S2 + S3 frame.
+        verbose: Whether to print timing.
+    """
+    t0 = time.time()
+    n_s1 = len(s1)
+    for key, column in FREQUENCY_FIELDS.items():
+        codes, uniques = pd.factorize(pd.concat([s1[column], tgt[column]], ignore_index=True))
+        codes = np.maximum(codes, 0)
+        n_codes = max(len(uniques), 1)
+        in_s1 = np.bincount(codes[:n_s1], minlength=n_codes).astype(np.int32)
+        in_tgt = np.bincount(codes[n_s1:], minlength=n_codes).astype(np.int32)
+        empty = pd.Index(uniques).get_indexer([""])[0]
+        if empty >= 0:
+            in_s1[empty] = in_tgt[empty] = 0
+        s1[f"{key}_n_s1"], s1[f"{key}_n_tgt"] = in_s1[codes[:n_s1]], in_tgt[codes[:n_s1]]
+        tgt[f"{key}_n_s1"], tgt[f"{key}_n_tgt"] = in_s1[codes[n_s1:]], in_tgt[codes[n_s1:]]
+        del codes, uniques
+    if verbose:
+        print(f"  Name/address frequencies counted over {n_s1:,} S1 + {len(tgt):,} "
+              f"S2/S3 records ({time.time() - t0:.0f}s)")
+
+
+def frequency_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_idx: np.ndarray,
+                       tgt_idx: np.ndarray) -> dict:
+    """
+    Frequency counts of both sides of every pair (see add_frequency_columns).
+
+    Args:
+        s1: S1 frame with the frequency columns.
+        tgt: S2 + S3 frame with the frequency columns.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
+
+    Returns:
+        Dict of feature name → array (empty if the columns are missing).
+    """
+    out = {}
+    for key in FREQUENCY_FIELDS:
+        for count in ("n_s1", "n_tgt"):
+            column = f"{key}_{count}"
+            if column in s1 and column in tgt:
+                out[f"s1_{column}"] = s1[column].to_numpy()[s1_idx].astype(np.float32)
+                out[f"cand_{column}"] = tgt[column].to_numpy()[tgt_idx].astype(np.float32)
+    return out
+
+
+def cross_features(cols: dict) -> dict:
+    """
+    Name × address interactions from the string similarities.
+
+    Args:
+        cols: Feature columns built so far (needs the "string" group).
+
+    Returns:
+        Dict of feature name → array (empty if the similarities are missing).
+    """
+    needed = ("name_core_token_set_ratio", "addr_token_set_ratio", "name_core_ratio", "addr_ratio")
+    if not all(c in cols for c in needed):
+        return {}
+    name_sim, addr_sim = cols["name_core_token_set_ratio"], cols["addr_token_set_ratio"]
+    name_exact = (cols["name_core_ratio"] >= 1.0).astype(np.float32)
+    addr_exact = (cols["addr_ratio"] >= 1.0).astype(np.float32)
+    return {
+        "name_x_addr": name_sim * addr_sim,
+        "name_addr_min": np.minimum(name_sim, addr_sim),
+        "name_addr_max": np.maximum(name_sim, addr_sim),
+        "name_exact": name_exact,
+        "addr_exact": addr_exact,
+        "name_exact_x_addr": name_exact * addr_sim,
+        "addr_exact_x_name": addr_exact * name_sim,
+    }
+
 
 def group_max(groups: np.ndarray, values: np.ndarray) -> np.ndarray:
     """
@@ -291,6 +464,12 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
         chunks.append(chunk_features(s1, tgt, s1_idx[start:end], tgt_idx[start:end]))
     cols = {name: np.concatenate([c[name] for c in chunks]).astype(np.float32)
             for name in (chunks[0] if chunks else {})}
+
+    if groups.get("cross", True):
+        cols.update(cross_features(cols))
+
+    if groups.get("frequency", True):
+        cols.update(frequency_features(s1, tgt, s1_idx, tgt_idx))
 
     if groups.get("tfidf", True):
         for c in pairs.columns:
