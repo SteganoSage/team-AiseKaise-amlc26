@@ -779,9 +779,42 @@ def run_validator() -> None:
         print("  ✗ Validator FAILED — do not upload these files.")
 
 
+def _train_state_path() -> str:
+    """Where the training half of --mode test leaves what the test half needs."""
+    return os.path.join(config.MODEL_DIR, "test_train_state.pkl")
+
+
+def _exec_predict() -> None:
+    """
+    Replace this process with a fresh one running the test half (--mode predict).
+
+    Memory the training half freed is often not handed back to the operating
+    system (Python / Arrow allocators keep it), and on Kaggle the test split
+    was then loaded on top of it and stalled out of memory. os.execv starts a
+    new interpreter in the same process (same PID, same stdout), so the
+    notebook keeps streaming the log and the test half starts with empty memory.
+    """
+    args = list(sys.argv[1:])
+    for i, arg in enumerate(args):
+        if arg == "--mode" and i + 1 < len(args):
+            args[i + 1] = "predict"
+        elif arg.startswith("--mode="):
+            args[i] = "--mode=predict"
+    cmd = [sys.executable, "-u", os.path.abspath(sys.argv[0])] + args
+    print(f"\n[test] Training done; restarting as a fresh process for the test half "
+          f"(frees the training memory): {' '.join(cmd[2:])}", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, cmd)
+
+
 def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     """
     Fit on train data → predict the test set → write outputs → validate.
+
+    The training half saves the models and a small state file, then (with
+    config.TEST_FRESH_PROCESS) hands over to a fresh process for the test half
+    (run_predict), so the test split does not share memory with training.
 
     Args:
         train_sample_s1: Train on this many random train S1 records (all
@@ -799,12 +832,39 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     X, names = stage3_features(data, cand["pairs"], verbose)
     fitted = fit_matcher(X, cand["pairs"], cand["labels"], data["n_true_by_row"],
                          np.arange(len(data["s1"])), names, verbose)
-    pruner = cand["pruner"]
     train.save_model(fitted["model"])
-    train.save_model(pruner, os.path.join(config.MODEL_DIR, "pruner_model.pkl"))
-    train_info = {"stage1": cand["stage1"], "stage2": cand["stage2"]}
-    del data, cand, X
+    train.save_model(cand["pruner"], os.path.join(config.MODEL_DIR, "pruner_model.pkl"))
+    state = {"names": names, "threshold": fitted["threshold"], "oof_f05": fitted["oof_f05"],
+             "num_boost_round": fitted["num_boost_round"],
+             "train_info": {"stage1": cand["stage1"], "stage2": cand["stage2"]},
+             "train_sample_s1": train_sample_s1, "start_time": start_time}
+    with open(_train_state_path(), "wb") as f:
+        pickle.dump(state, f)
+    del data, cand, X, fitted
     gc.collect()
+
+    if config.TEST_FRESH_PROCESS:
+        _exec_predict()   # does not return
+    run_predict(verbose)
+
+
+def run_predict(verbose: bool = True) -> None:
+    """
+    Test half of --mode test: score the test set with the saved models.
+
+    Loads the LightGBM matcher, the pruner and the state saved by run_test,
+    then predicts, writes both output files and runs the validator.
+
+    Args:
+        verbose: Whether to print progress.
+    """
+    with open(_train_state_path(), "rb") as f:
+        state = pickle.load(f)
+    start_time, names, train_info = state["start_time"], state["names"], state["train_info"]
+    fitted = {"model": train.load_model(), "threshold": state["threshold"],
+              "oof_f05": state["oof_f05"], "num_boost_round": state["num_boost_round"]}
+    pruner = train.load_model(os.path.join(config.MODEL_DIR, "pruner_model.pkl"))
+    train_sample_s1 = state["train_sample_s1"]
 
     # ── Test ──
     test = load_split("test", verbose=verbose)
@@ -868,9 +928,10 @@ def main():
     """Main entry point for the pipeline."""
     parser = argparse.ArgumentParser(description="Business Entity Resolution Pipeline")
     parser.add_argument(
-        "--mode", choices=["validate", "loco", "test"], required=True,
+        "--mode", choices=["validate", "loco", "test", "predict"], required=True,
         help="'validate' = local F0.5 on a train holdout; 'loco' = leave one "
-             "country out; 'test' = predict on test set",
+             "country out; 'test' = train, then predict on the test set; "
+             "'predict' = test half only, with the models a 'test' run saved",
     )
     parser.add_argument("--data-dir", help="Folder with train/ and test/ (default: <repo>/dataset)")
     parser.add_argument("--output-dir", help="Where to write the TSVs (default: <repo>/output)")
@@ -906,6 +967,8 @@ def main():
         run_loco(args.sample_s1)
     elif args.mode == "test":
         run_test(args.train_sample_s1)
+    elif args.mode == "predict":
+        run_predict()
 
 
 if __name__ == "__main__":
