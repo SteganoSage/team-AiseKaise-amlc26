@@ -217,6 +217,11 @@ LGBM_PARAMS = {
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
     "min_child_samples": 20,
+    # Regularization: without it single trees made outsized corrections (train
+    # loss rose after ~300 rounds, CV folds stopped at 144-635 rounds). 100k
+    # validate: holdout F0.5 0.9532 -> 0.9564, folds 588-752 rounds.
+    "lambda_l2": 1.0,
+    "min_sum_hessian_in_leaf": 1.0,
     "verbose": -1,
     "seed": RANDOM_SEED,
     "n_jobs": N_JOBS,
