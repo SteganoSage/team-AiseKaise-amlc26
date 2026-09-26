@@ -469,8 +469,10 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
     for start in range(0, len(pairs), step):
         end = start + step
         chunks.append(chunk_features(s1, tgt, s1_idx[start:end], tgt_idx[start:end]))
-    cols = {name: np.concatenate([c[name] for c in chunks]).astype(np.float32)
-            for name in (chunks[0] if chunks else {})}
+    cols = {}
+    for name in list(chunks[0]) if chunks else []:
+        cols[name] = np.concatenate([c.pop(name) for c in chunks]).astype(np.float32, copy=False)
+    del chunks
 
     if groups.get("cross", True):
         cols.update(cross_features(cols))
@@ -509,9 +511,12 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
         if "score_embedding" in pairs:
             cols["blk_rank_embedding"] = pairs["rank_embedding"].to_numpy(dtype=np.float32)
 
+    # Fill the matrix one column at a time, freeing each column as it is copied,
+    # so the columns and the matrix (~8.6M test pairs x 91) are not both held
     names = list(cols)
-    X = np.column_stack([cols[n] for n in names]).astype(np.float32, copy=False) \
-        if len(pairs) else np.empty((0, len(names)), dtype=np.float32)
+    X = np.empty((len(pairs), len(names)), dtype=np.float32)
+    for j, name in enumerate(names):
+        X[:, j] = cols.pop(name)
     if verbose:
         print(f"  Stage-3 features: {len(pairs):,} pairs × {len(names)}")
     return X, names

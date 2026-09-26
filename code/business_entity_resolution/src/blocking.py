@@ -470,7 +470,9 @@ def generate_candidates(s1: pd.DataFrame, tgt: pd.DataFrame,
         parts.append(part)
 
     pairs = pd.concat(parts, ignore_index=True)
-    return pairs.sort_values(["s1_idx", "tgt_idx"], kind="stable").reset_index(drop=True)
+    del parts  # free the per-source frames before sorting (tens of millions of pairs)
+    order = np.lexsort((pairs["tgt_idx"].to_numpy(), pairs["s1_idx"].to_numpy()))
+    return pairs.take(order).reset_index(drop=True)
 
 
 # ──────────────────────────────────────────────────────────────────────

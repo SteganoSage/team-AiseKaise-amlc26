@@ -230,15 +230,25 @@ def build_candidates(data: dict, pruner=None, fit_final_pruner: bool = False,
 
     print("\n[stage 2] Pruning...")
     t0 = time.time()
-    Xp, pruner_names = prune.pruner_features(pairs, s1, tgt, verbose)
-    groups = pairs["s1_idx"].to_numpy()
     if pruner is None:
+        Xp, pruner_names = prune.pruner_features(pairs, s1, tgt, verbose)
+        groups = pairs["s1_idx"].to_numpy()
         prob = prune.oof_pruner_scores(Xp, labels, groups, pruner_names, verbose)
         if fit_final_pruner:
             pruner = prune.fit_pruner(Xp, labels, groups, pruner_names)
+        del Xp
     else:
-        prob = pruner.predict(Xp).astype(np.float32)
-    del Xp
+        # Test: the pruner features are per pair, so build and score them in
+        # slices; the full matrix (~76M pairs x 13 on test) is never held at once
+        prob = np.empty(len(pairs), dtype=np.float32)
+        step = config.PRUNE_PREDICT_CHUNK
+        for start in range(0, len(pairs), step):
+            Xp, _ = prune.pruner_features(pairs.iloc[start:start + step], s1, tgt, verbose=False)
+            prob[start:start + step] = pruner.predict(Xp)
+            del Xp
+        if verbose:
+            print(f"  Pruner features + scores: {len(pairs):,} pairs, "
+                  f"{-(-len(pairs) // step)} slices of {step:,}")
     gc.collect()
 
     keep = prune.select(pairs, prob)

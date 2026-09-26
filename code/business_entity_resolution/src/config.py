@@ -164,6 +164,7 @@ PRUNE_MIN_PROB = 0.03     # ...and only those with pruner probability ≥ this
 PRUNE_SWEEP = True
 PRUNE_SWEEP_TOP_N = (6, 7, 8)
 PRUNE_SWEEP_MIN_PROB = (0.03, 0.05, 0.1)
+PRUNE_PREDICT_CHUNK = 5_000_000  # test: pairs per slice of pruner features + scores
 PRUNE_FOLDS = 2           # out-of-fold pruning on train (by S1 entity)
 PRUNE_ROUNDS = 200        # boosting rounds for the pruner
 PRUNE_MAX_TRAIN_PAIRS = 20_000_000  # subsample S1 entities above this
