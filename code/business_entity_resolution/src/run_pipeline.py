@@ -152,6 +152,9 @@ def load_split(split: str, sample_s1: int = None, verbose: bool = True) -> dict:
     if config.SNAP_TO_REFERENCE:
         # Uses all S1 records (before sampling) as the vocabulary
         tgt = normalize.snap_to_reference(tgt, s1, verbose)
+    if config.FEATURE_GROUPS.get("frequency", True):
+        # Whole split, before sampling: same counts in training and at test time
+        features.add_frequency_columns(s1, tgt, verbose)
 
     if sample_s1 and sample_s1 < len(s1):
         rows = np.sort(np.random.default_rng(config.RANDOM_SEED)
