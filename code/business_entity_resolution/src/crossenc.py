@@ -21,9 +21,15 @@ feature columns.
 """
 
 import math
+import os
 import time
 
 import numpy as np
+
+# Quiet logs: no per-weight "Loading weights" bars or hub download bars
+# (they flood the Kaggle log); our own progress lines are printed instead.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import config
 from prune import take_strings
@@ -95,6 +101,51 @@ def _device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _quiet_transformers() -> None:
+    """Turn off transformers' own progress bars and info logging."""
+    try:
+        from transformers.utils import logging as hf_logging
+        hf_logging.disable_progress_bar()
+        hf_logging.set_verbosity_error()
+    except Exception:  # older / newer transformers without these helpers
+        pass
+
+
+def save(bundle: dict, path: str) -> None:
+    """
+    Save the fine-tuned cross-encoder (weights + tokenizer) to a folder.
+
+    --mode test restarts as a fresh process between training and the test
+    half, so the model must survive on disk.
+
+    Args:
+        bundle: Output of fit.
+        path: Folder to write.
+    """
+    os.makedirs(path, exist_ok=True)
+    bundle["model"].save_pretrained(path)
+    bundle["tokenizer"].save_pretrained(path)
+    print(f"  ✓ Cross-encoder saved to {path}")
+
+
+def load(path: str) -> dict:
+    """
+    Load a cross-encoder saved by save() onto the GPU (CPU if none).
+
+    Args:
+        path: Folder written by save().
+
+    Returns:
+        Dict with the tokenizer and the model, ready for score().
+    """
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    _quiet_transformers()
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    model = AutoModelForSequenceClassification.from_pretrained(path).to(_device()).eval()
+    print(f"  ✓ Cross-encoder loaded from {path}")
+    return {"tokenizer": tokenizer, "model": model}
+
+
 def fit(data: dict, pairs, labels: np.ndarray, ce_rows: np.ndarray,
         verbose: bool = True) -> dict:
     """
@@ -118,6 +169,7 @@ def fit(data: dict, pairs, labels: np.ndarray, ce_rows: np.ndarray,
     from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
                               get_linear_schedule_with_warmup)
 
+    _quiet_transformers()
     t0 = time.time()
     torch.manual_seed(config.RANDOM_SEED)
     sel = np.flatnonzero(np.isin(pairs["s1_idx"].to_numpy(), ce_rows))
@@ -180,7 +232,8 @@ def score(bundle: dict, data: dict, pairs, verbose: bool = True) -> np.ndarray:
     Match probability of every candidate pair.
 
     Pairs are scored in order of text length so each batch pads to a similar
-    length (much faster), then put back in the original order.
+    length (much faster), then put back in the original order. With more than
+    one GPU (Kaggle "T4 x2") each batch is split across all of them.
 
     Args:
         bundle: Output of fit.
@@ -197,9 +250,15 @@ def score(bundle: dict, data: dict, pairs, verbose: bool = True) -> np.ndarray:
     tokenizer, model = bundle["tokenizer"], bundle["model"]
     device = next(model.parameters()).device
     use_amp = device.type == "cuda"
+    n_gpu = torch.cuda.device_count() if use_amp else 0
+    if n_gpu > 1:
+        model = torch.nn.DataParallel(model)
     out = np.empty(len(pairs), dtype=np.float32)
     s1_idx, tgt_idx = pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy()
-    batch = config.CROSSENC_SCORE_BATCH
+    batch = config.CROSSENC_SCORE_BATCH * max(n_gpu, 1)
+    if verbose:
+        print(f"\n[cross-encoder] Scoring {len(pairs):,} pairs on "
+              f"{f'{n_gpu} GPU(s)' if use_amp else 'CPU'}, batch {batch}...")
     chunk = config.CROSSENC_SCORE_CHUNK   # pairs whose texts are held at once
     for c_start in range(0, len(pairs), chunk):
         c_end = min(c_start + chunk, len(pairs))
@@ -213,7 +272,8 @@ def score(bundle: dict, data: dict, pairs, verbose: bool = True) -> np.ndarray:
                                 max_length=config.CROSSENC_MAX_LENGTH, padding=True,
                                 return_tensors="pt").to(device)
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    logits = model(**enc).logits.squeeze(-1)
+                    # return_dict=False: a plain tuple gathers cleanly across GPUs
+                    logits = model(**enc, return_dict=False)[0].squeeze(-1)
                 probs[idx] = torch.sigmoid(logits.float()).cpu().numpy()
         out[c_start:c_end] = probs
         if verbose:

@@ -199,7 +199,8 @@ The threshold is re-tuned automatically on every run, so a combination never get
 
 | Holdout F0.5 | P / R | Cands per S1 (stage 2 / stage 1) | Candidate recall (stage 2 / stage 1) | India / US F0.5 | Threshold |
 |---|---|---|---|---|---|
-| **0.9663** (all-empty 0.057), OOF 0.9658 | 0.984 / 0.929 | 4.96 / 44.4 | 0.951 / 0.962 | 0.955 / 0.974 | 0.66 |
+| **0.9708** — `dhruv-crossenc` @ 53ae51a (+ fine-tuned e5-small cross-encoder feature, Kaggle GPU T4; LightGBM on 64k dev S1), OOF 0.9709 | 0.987 / 0.936 | 4.97 / 44.4 | 0.950 / 0.962 | 0.961 / 0.977 | 0.70 |
+| 0.9663 (all-empty 0.057), OOF 0.9658 | 0.984 / 0.929 | 4.96 / 44.4 | 0.951 / 0.962 | 0.955 / 0.974 | 0.66 |
 | 0.9633 — `llm-advice` @ 27ad884 (lavya + the three feature groups only) | 0.983 / 0.921 | 4.94 / 35.3 | 0.943 / 0.955 | 0.954 / 0.970 | 0.68 |
 | 0.9595 — `dhruv` @ 6924198 (lavya + address canonicalization + blockers only), OOF 0.9586 | 0.979 / 0.921 | 4.97 / 44.4 | 0.950 / 0.962 | 0.948 / 0.967 | 0.69 |
 | 0.9559 — `lavya` @ 7588b67 (lambda_l2=1, prune 8/0.03) | | 4.92 / 35.3 | | 0.946 / 0.962 | |
