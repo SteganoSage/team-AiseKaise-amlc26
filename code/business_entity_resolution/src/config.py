@@ -112,12 +112,14 @@ SNAP_TO_REFERENCE = True
 # ──────────────────────────────────────────────────────────────────────
 
 # Hashed TF-IDF over word 1-2 grams, per source, searched per country:
-#   "name":     name_core
+#   "name":     name_core, words sorted alphabetically (word-order swaps)
 #   "combined": name_norm + address_norm
 #   "address":  address_norm only (finds records whose name is garbled but
-#               whose house number + street match; 0 = off)
+#               whose house number + street match; 0 = off). Slice test-like
+#               run: F0.5 0.9673 → 0.9682, stage-1 recall 0.9810 → 0.9827,
+#               same final candidates per S1 (the pruner caps them).
 # Top-K per blocker per source per S1 entity.
-BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 0}
+BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 10}
 BLOCKING_TOP_K_EMBEDDING = 10
 
 # Terms (words or word pairs) found in more than this many S2/S3 records of
@@ -206,8 +208,14 @@ FEATURE_GROUPS = {
     "tfidf": True,      # blocking TF-IDF cosines (name, name+address) + their ranks
     "numbers": True,    # overlap of all numbers in the address
     "structure": True,  # postal code / house number / country / lengths / missing / source
-    "rank": True,       # rank + gap to best within the S1's candidates and the
-                        # candidate's S1s, mutual best, candidate counts
+    "rank": True,       # rank + gap to best within the S1's candidates, candidate count
+    # Rank / gap among the S1s that share a candidate, mutual best, S1s per
+    # candidate. Their values depend on how many S1 records are loaded (test
+    # scores all test S1, training uses a --train-sample-s1 sample). Measured
+    # like test on an Iowa+Rajasthan slice (train on 15% of S1, score the rest
+    # with all S1 loaded): they hurt the unregularized LightGBM (0.9655 on vs
+    # 0.9679 off) but help the current one (lambda_l2=1): 0.9684 on vs 0.9673 off.
+    "cand_context": True,
     "blockers": True,   # which blockers produced the pair
     "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)

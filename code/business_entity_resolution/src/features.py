@@ -236,6 +236,10 @@ def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
     - mutual best: best candidate for its S1 AND best S1 for its candidate
     Plus how many candidates the S1 has and how many S1s the candidate has.
 
+    The candidate-side features (second and third bullet, S1s per candidate)
+    depend on how many S1 records are loaded, so they are only built when
+    config.FEATURE_GROUPS["cand_context"] is on (see config.py).
+
     Args:
         s1_idx: S1 row per pair.
         tgt_idx: Target row per pair.
@@ -244,18 +248,21 @@ def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
     Returns:
         Dict of feature name → array.
     """
+    cand_context = config.FEATURE_GROUPS.get("cand_context", True)
     out = {}
     for key, values in sims.items():
         rank_s1 = group_rank(s1_idx, values)
-        rank_cand = group_rank(tgt_idx, values)
         out[f"rank_{key}_in_s1"] = rank_s1.astype(np.float32)
         out[f"gap_{key}_to_s1_best"] = group_max(s1_idx, values) - values
-        out[f"rank_{key}_in_cand"] = rank_cand.astype(np.float32)
-        out[f"gap_{key}_to_cand_best"] = group_max(tgt_idx, values) - values
-        out[f"mutual_best_{key}"] = ((rank_s1 == 1) & (rank_cand == 1)).astype(np.float32)
+        if cand_context:
+            rank_cand = group_rank(tgt_idx, values)
+            out[f"rank_{key}_in_cand"] = rank_cand.astype(np.float32)
+            out[f"gap_{key}_to_cand_best"] = group_max(tgt_idx, values) - values
+            out[f"mutual_best_{key}"] = ((rank_s1 == 1) & (rank_cand == 1)).astype(np.float32)
     out["n_cands_for_s1"] = np.bincount(s1_idx)[s1_idx].astype(np.float32)
-    _, inverse, counts = np.unique(tgt_idx, return_inverse=True, return_counts=True)
-    out["n_s1_for_cand"] = counts[inverse].astype(np.float32)
+    if cand_context:
+        _, inverse, counts = np.unique(tgt_idx, return_inverse=True, return_counts=True)
+        out["n_s1_for_cand"] = counts[inverse].astype(np.float32)
     return out
 
 
