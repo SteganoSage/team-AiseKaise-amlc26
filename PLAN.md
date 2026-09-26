@@ -43,6 +43,8 @@ The dataset goes in `dataset/train/` and `dataset/test/` (unzip the organizers' 
 **Kaggle — where all full runs happen** (free CPU session: ~30 GB RAM, 4 cores, up to 12 h).
 Easiest: import **`notebooks/00_run_pipeline_kaggle.ipynb`** (File → Import Notebook), set `BRANCH` / `MODE` in the
 first cell, and for long runs use **Save Version → Save & Run All** (keeps running with the browser closed).
+Test runs end with `submission_<branch>_<commit>.zip` in the version's Output tab: download that (a bare `.tsv`
+opens as text in a storage.googleapis.com tab), unzip, and upload `matching_results.tsv`.
 One-time: upload the organizers' zip as a **private** Kaggle dataset (kaggle.com/datasets → New Dataset;
 the notebook finds the files wherever Kaggle unpacks them), add it via *Add Input*, turn *Internet* on,
 and add a *Secret* `GITHUB_TOKEN` (GitHub token that can read this private repo). Manual version:
@@ -193,17 +195,21 @@ The threshold is re-tuned automatically on every run, so a combination never get
 
 ### Idea list
 
-**Baseline to beat** (Kaggle, `--mode validate --sample-s1 20000`, 20k train S1 vs **all 10.3M S2/S3**, 12.5 min):
+**Baseline to beat** (Kaggle, `--mode validate --sample-s1 100000`, 100k train S1 vs **all 10.3M S2/S3**, 17 min, `dhruv` @ 80cea9e = main + transliteration). **Every experiment: same `SAMPLE_S1 = 100_000`, compare to the bold row.**
 
 | Holdout F0.5 | P / R | Cands per S1 (stage 2 / stage 1) | Candidate recall (stage 2 / stage 1) | India / US F0.5 | Threshold |
 |---|---|---|---|---|---|
-| **0.9343** (all-empty 0.055) | 0.964 / 0.877 | 6.16 / 35.4 | 0.935 / 0.941 | 0.905 / 0.952 | 0.69 |
+| **0.9532** (all-empty 0.057) | 0.976 / 0.908 | 5.96 / 35.3 | 0.950 / 0.955 | 0.941 / 0.961 | 0.71 |
+| 0.9343 — first baseline, before transliteration (20k S1) | 0.964 / 0.877 | 6.16 / 35.4 | 0.935 / 0.941 | 0.905 / 0.952 | 0.69 |
 
-What it says: **blocking is the bottleneck** — 5.9% of true matches never become candidates (the model
-can't recover those), pruning only loses 0.6% more. The `name` blocker barely helps at full scale
-(recall 0.56, only 440 pairs found by it alone) because `BLOCKING_MAX_DF = 2000` drops most name terms
-when there are 5M records. **India is weaker at every stage** (Devanagari script is a likely cause).
-Compare every experiment against this row with the same `--sample-s1 20000`.
+Leaderboard: `sub-d2-1` (same code, trained on 300k S1) = **0.946** public. With India 0.941 / US 0.961 and the test
+mix (India 47%, US 38%, France 15%) that puts **France ≈ 0.91** — fine; **India is the biggest lever** (47% of test,
+lowest score, candidate recall 0.932 vs US 0.963).
+
+What it says: **blocking is still the bottleneck** — 4.5% of true matches never become candidates (the model
+can't recover those), pruning only loses 0.5% more. The `name` blocker barely helps at full scale
+(recall 0.60, ~3k pairs found by it alone) because `BLOCKING_MAX_DF = 2000` drops most name terms
+when there are 5M records. **India is weaker at every stage.**
 
 **Day 1 first moves:** leader → private Kaggle dataset + `00_run_pipeline_kaggle.ipynb` with `MODE="test"`
 (Save & Run All) for the first real upload; one person → #A (full-scale validate on Kaggle, runtime/memory); one person → #2 (read

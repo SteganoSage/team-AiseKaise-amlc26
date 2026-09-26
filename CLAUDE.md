@@ -257,7 +257,7 @@ amazon-ml-challenge-2026/
 ├── output/                        # latest matching_results.tsv + candidate_pairs.tsv
 ├── submissions/
 │   ├── LOG.md                     # every leaderboard upload (see §9)
-│   └── <tag>/                     # copy of each uploaded matching_results.tsv + candidate_pairs.tsv
+│   └── <tag>/                     # run_info.json of each upload (the TSVs are gitignored: >100 MB)
 ├── code/
 │   └── business_entity_resolution/
 │       ├── README.md              # exact end-to-end run instructions
