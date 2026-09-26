@@ -440,7 +440,8 @@ def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
 
 
 def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFrame,
-                         embeddings: dict = None, verbose: bool = True) -> tuple:
+                         embeddings: dict = None, verbose: bool = True,
+                         extra: dict = None) -> tuple:
     """
     Build the stage-3 feature matrix for the pruned candidate pairs.
 
@@ -455,6 +456,9 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
         embeddings: Optional {"s1": {"name", "full"}, "tgt": {"name", "full"}}
             embedding arrays aligned with the frames.
         verbose: Whether to print progress.
+        extra: Optional {feature name: array aligned with pairs} computed
+            elsewhere (e.g. "crossenc_prob" from crossenc.py). A
+            "crossenc_prob" also gets rank / gap features like the other scores.
 
     Returns:
         Tuple (X float32 matrix, feature names).
@@ -502,7 +506,12 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
                 "combined": pairs["score_combined"].to_numpy(dtype=np.float32)}
         if "pruner_prob" in pairs:
             sims["pruner"] = pairs["pruner_prob"].to_numpy(dtype=np.float32)
+        if extra and "crossenc_prob" in extra:
+            sims["crossenc"] = np.asarray(extra["crossenc_prob"], dtype=np.float32)
         cols.update(rank_features(s1_idx, tgt_idx, sims))
+
+    for name, values in (extra or {}).items():
+        cols[name] = np.asarray(values, dtype=np.float32)
 
     if groups.get("embedding", True) and embeddings is not None:
         for field in ("name", "full"):

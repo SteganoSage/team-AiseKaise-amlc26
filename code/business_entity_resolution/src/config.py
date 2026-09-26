@@ -187,6 +187,26 @@ PRUNER_PARAMS = {
 # a GPU is recommended — use on Kaggle)
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# Optional transformer cross-encoder (crossenc.py)
+# ──────────────────────────────────────────────────────────────────────
+
+# Fine-tune a small multilingual transformer on the reserved share of training
+# S1 entities and add its match probability (plus its rank / gap within each
+# S1's candidates) to the stage-3 features. Needs a CUDA GPU; without one it
+# is off for the whole run.
+USE_CROSSENC = True
+CROSSENC_MODEL_NAME = "intfloat/multilingual-e5-small"  # MIT, 118M params (MODELS.md)
+CROSSENC_TRAIN_FRAC = 0.2         # share of training S1 reserved to fine-tune it
+CROSSENC_MAX_TRAIN_PAIRS = 400_000
+CROSSENC_EPOCHS = 2
+CROSSENC_LR = 3e-5
+CROSSENC_TRAIN_BATCH = 64
+CROSSENC_MAX_LENGTH = 80          # tokens for both "name | address" texts together
+CROSSENC_SCORE_BATCH = 512
+CROSSENC_SCORE_CHUNK = 1_000_000  # pairs whose texts are built at once when scoring
+CROSSENC_ALLOW_CPU = False        # tests on tiny data only
+
 # When True: an extra embedding kNN blocker (BLOCKING_TOP_K_EMBEDDING per
 # source) and embedding-cosine pair features.
 USE_EMBEDDINGS = False

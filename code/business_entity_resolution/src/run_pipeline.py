@@ -58,6 +58,7 @@ import config
 import io_utils
 import normalize
 import blocking
+import crossenc
 import prune
 import features
 import train
@@ -304,7 +305,8 @@ def fit_matcher(X: np.ndarray, pairs: pd.DataFrame, labels: np.ndarray,
             "num_boost_round": num_boost_round, "oof_f05": oof_f05}
 
 
-def stage3_features(data: dict, pairs: pd.DataFrame, verbose: bool = True) -> tuple:
+def stage3_features(data: dict, pairs: pd.DataFrame, verbose: bool = True,
+                    extra: dict = None) -> tuple:
     """
     Stage-3 feature matrix for a split's pruned candidate pairs.
 
@@ -312,13 +314,16 @@ def stage3_features(data: dict, pairs: pd.DataFrame, verbose: bool = True) -> tu
         data: Output of load_split.
         pairs: Pruned candidate pairs.
         verbose: Whether to print progress.
+        extra: Optional extra feature columns aligned with pairs
+            (the cross-encoder score).
 
     Returns:
         Tuple (X, feature_names).
     """
     t0 = time.time()
     X, names = features.build_feature_matrix(pairs, data["s1"], data["tgt"],
-                                             embeddings=data["emb"], verbose=verbose)
+                                             embeddings=data["emb"], verbose=verbose,
+                                             extra=extra)
     print(f"  stage-3 features took {time.time() - t0:.0f}s")
     return X, names
 
@@ -462,6 +467,7 @@ def save_run_info(mode: str, info: dict) -> None:
     path = os.path.join(config.MODEL_DIR, f"run_info_{mode}.json")
     info = {"mode": mode, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "use_embeddings": config.USE_EMBEDDINGS,
+            "use_crossenc_config": bool(config.USE_CROSSENC),
             "snap_to_reference": config.SNAP_TO_REFERENCE,
             "top1_threshold": config.TOP1_THRESHOLD,
             "feature_groups": config.FEATURE_GROUPS,
@@ -636,11 +642,21 @@ def run_validate(sample_s1: int = None, verbose: bool = True) -> float:
     data = load_split("train", sample_s1, verbose)
     cand = build_candidates(data, verbose=verbose)
     pairs, labels = cand["pairs"], cand["labels"]
-    X, names = stage3_features(data, pairs, verbose)
 
     dev_rows, hold_rows = train.holdout_split_rows(len(data["s1"]))
-    is_dev = np.isin(pairs["s1_idx"].to_numpy(), dev_rows)
-    dev, hold = np.flatnonzero(is_dev), np.flatnonzero(~is_dev)
+    extra = None
+    if crossenc.enabled():
+        # Part of the dev S1 fine-tunes the cross-encoder and is then left out
+        # of LightGBM training; the holdout S1 are the same as without it
+        ce_rows, dev_rows = crossenc.split_rows(dev_rows)
+        bundle = crossenc.fit(data, pairs, labels, ce_rows, verbose)
+        extra = {"crossenc_prob": crossenc.score(bundle, data, pairs, verbose)}
+        del bundle
+    X, names = stage3_features(data, pairs, verbose, extra)
+
+    s1_of_pair = pairs["s1_idx"].to_numpy()
+    dev = np.flatnonzero(np.isin(s1_of_pair, dev_rows))
+    hold = np.flatnonzero(np.isin(s1_of_pair, hold_rows))
     print(f"\n  Dev S1: {len(dev_rows):,} ({len(dev):,} pairs), "
           f"Holdout S1: {len(hold_rows):,} ({len(hold):,} pairs)")
 
@@ -682,6 +698,7 @@ def run_validate(sample_s1: int = None, verbose: bool = True) -> float:
 
     save_run_info("validate", {
         "sample_s1": sample_s1, "holdout": metrics, "holdout_by_country": by_country,
+        "crossenc_used": extra is not None,
         "stage1": cand["stage1"], "stage2": cand["stage2"],
         "oof_f05": fitted["oof_f05"], "threshold": fitted["threshold"],
         "num_boost_round": fitted["num_boost_round"], "n_features": len(names),
@@ -796,9 +813,19 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     # ── Train ──
     data = load_split("train", train_sample_s1, verbose)
     cand = build_candidates(data, fit_final_pruner=True, verbose=verbose)
-    X, names = stage3_features(data, cand["pairs"], verbose)
-    fitted = fit_matcher(X, cand["pairs"], cand["labels"], data["n_true_by_row"],
-                         np.arange(len(data["s1"])), names, verbose)
+    fit_rows = np.arange(len(data["s1"]))
+    bundle, extra = None, None
+    if crossenc.enabled():
+        # Reserved S1 fine-tune the cross-encoder and are left out of LightGBM
+        ce_rows, fit_rows = crossenc.split_rows(fit_rows)
+        bundle = crossenc.fit(data, cand["pairs"], cand["labels"], ce_rows, verbose)
+        extra = {"crossenc_prob": crossenc.score(bundle, data, cand["pairs"], verbose)}
+    X, names = stage3_features(data, cand["pairs"], verbose, extra)
+    sel = np.flatnonzero(np.isin(cand["pairs"]["s1_idx"].to_numpy(), fit_rows))
+    if len(sel) < len(X):
+        X = X[sel]
+    fitted = fit_matcher(X, cand["pairs"].iloc[sel], cand["labels"][sel], data["n_true_by_row"],
+                         fit_rows, names, verbose)
     pruner = cand["pruner"]
     train.save_model(fitted["model"])
     train.save_model(pruner, os.path.join(config.MODEL_DIR, "pruner_model.pkl"))
@@ -812,7 +839,11 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     pairs = tcand["pairs"]
     if config.PRUNE_SWEEP:
         report_test_prune_sizes(test["s1"], pairs)
-    X_test, test_names = stage3_features(test, pairs, verbose)
+    test_extra = None
+    if bundle is not None:
+        test_extra = {"crossenc_prob": crossenc.score(bundle, test, pairs, verbose)}
+        del bundle
+    X_test, test_names = stage3_features(test, pairs, verbose, test_extra)
     if test_names != names:
         raise RuntimeError("Train and test feature columns differ — check config.")
     scores = predict.predict_scores(fitted["model"], X_test)
@@ -855,6 +886,7 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     save_run_info("test", {
         "oof_f05": fitted["oof_f05"], "threshold": fitted["threshold"],
         "num_boost_round": fitted["num_boost_round"], "train": train_info,
+        "crossenc_used": test_extra is not None,
         "test_stage1": tcand["stage1"], "test_stage2": tcand["stage2"],
         "test_s1": len(s1), "test_s1_with_match": int(matched_rows.sum()),
         "test_links": int(len(keep)), "n_features": len(names),
