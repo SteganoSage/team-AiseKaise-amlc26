@@ -287,7 +287,7 @@ def fit_matcher(X: np.ndarray, pairs: pd.DataFrame, labels: np.ndarray,
     print(f"\n[stage 3] Final LightGBM on all pairs ({num_boost_round} rounds)...")
     model = train.train_model(X, labels, feature_names=feature_names,
                               num_boost_round=num_boost_round, verbose=verbose)
-    return {"model": model, "threshold": threshold,
+    return {"model": model, "threshold": threshold, "oof": oof,
             "num_boost_round": num_boost_round, "oof_f05": oof_f05}
 
 
@@ -465,6 +465,145 @@ def save_run_info(mode: str, info: dict) -> None:
 # Modes
 # ──────────────────────────────────────────────────────────────────────
 
+def _prune_mask(pairs: pd.DataFrame, top_n: int, min_prob: float) -> np.ndarray:
+    """
+    Pairs that would survive a stricter pruning setting.
+
+    The pairs are already pruned with config.PRUNE_TOP_N / PRUNE_MIN_PROB, so
+    their pruner rank within each S1 equals the rank before pruning, and any
+    stricter (smaller top-N, higher min-prob) setting is a subset of them.
+
+    Args:
+        pairs: Pruned pairs with s1_idx and pruner_prob.
+        top_n: Keep at most this many per S1.
+        min_prob: Keep only pairs with pruner probability ≥ this.
+
+    Returns:
+        Boolean mask over pairs.
+    """
+    prob = pairs["pruner_prob"].to_numpy()
+    rank = blocking.group_rank(pairs["s1_idx"].to_numpy(), prob)
+    return (rank <= top_n) & (prob >= min_prob)
+
+
+def _sweep_settings() -> list:
+    """
+    (top-N, min-prob) settings of the pruning sweep that are at least as
+    strict as the current config (looser ones would need the dropped pairs).
+
+    Returns:
+        List of (top_n, min_prob) tuples, current setting included.
+    """
+    return [(n, p) for n in config.PRUNE_SWEEP_TOP_N for p in config.PRUNE_SWEEP_MIN_PROB
+            if n <= config.PRUNE_TOP_N and p >= config.PRUNE_MIN_PROB]
+
+
+def _size_stats(s1_idx: np.ndarray, rows: np.ndarray) -> str:
+    """
+    Candidates-per-S1 distribution (mean / p90 / p99 / max) over some S1 rows.
+
+    Args:
+        s1_idx: S1 row of each kept pair.
+        rows: S1 rows to describe (S1 with no pair count as 0).
+
+    Returns:
+        Formatted string.
+    """
+    counts = np.bincount(s1_idx, minlength=int(rows.max()) + 1 if len(rows) else 0)[rows] \
+        if len(rows) else np.zeros(0)
+    if not len(counts):
+        return "-"
+    return (f"{counts.mean():5.2f} {np.percentile(counts, 90):4.0f} "
+            f"{np.percentile(counts, 99):4.0f} {counts.max():4.0f}")
+
+
+def report_prune_sweep(data: dict, pairs: pd.DataFrame, labels: np.ndarray,
+                       dev: np.ndarray, hold: np.ndarray, fitted: dict,
+                       hold_scores: np.ndarray, dev_rows: np.ndarray,
+                       hold_rows: np.ndarray) -> list:
+    """
+    Replay stricter pruning settings on this validate run's own scores.
+
+    For each setting: drop the pairs it would prune, re-tune the threshold on
+    the dev OOF scores of the remaining pairs, apply it to the holdout scores
+    and report holdout F0.5 / candidate recall / candidates per S1 overall and
+    per country. Approximate: stage-3 features that depend on the candidate
+    set (ranks, candidate counts) keep their values from the full set, so
+    confirm the chosen setting with a real run.
+
+    Args:
+        data: Output of load_split (train).
+        pairs: All pruned pairs of the run (dev + holdout).
+        labels: Their labels.
+        dev, hold: Indices of dev / holdout pairs.
+        fitted: fit_matcher output (needs "oof", aligned with dev).
+        hold_scores: Final-model scores of the holdout pairs.
+        dev_rows, hold_rows: Dev / holdout S1 rows.
+
+    Returns:
+        List of result dicts, one per setting.
+    """
+    s1_idx, tgt_idx = pairs["s1_idx"].to_numpy(), pairs["tgt_idx"].to_numpy()
+    is_s2 = pairs["is_s2"].to_numpy()
+    country = data["s1"]["country_norm"].to_numpy(dtype=object)
+    countries = sorted(set(country[hold_rows]))
+    grid = np.round(np.arange(0.40, 0.951, 0.02), 3)
+    n_true = data["n_true_by_row"]
+    results = []
+    print("\n[prune sweep] Stricter pruning replayed on this run (approximate; "
+          "threshold re-tuned on OOF)")
+    print(f"  {'top-N':>5s} {'min-p':>5s} {'thr':>5s}  {'F0.5':>6s} {'P':>6s} {'R':>6s} "
+          f"{'cand rec':>8s}  cands/S1: mean  p90  p99  max  | "
+          + " | ".join(f"{c} F0.5 / cands" for c in countries))
+    for top_n, min_prob in _sweep_settings():
+        mask = _prune_mask(pairs, top_n, min_prob)
+        dm, hm = mask[dev], mask[hold]
+        d, h = dev[dm], hold[hm]
+        threshold, _ = predict.tune_threshold(
+            fitted["oof"][dm], s1_idx[d], tgt_idx[d], is_s2[d], labels[d], n_true,
+            dev_rows, thresholds=grid, verbose=False)
+        keep = predict.decide(hold_scores[hm], s1_idx[h], tgt_idx[h], is_s2[h], threshold)
+        m = evaluate_rows(pairs.iloc[h], labels[h], keep, n_true, hold_rows)
+        per_country = []
+        kept = np.zeros(len(h), dtype=bool)
+        kept[keep] = True
+        for c in countries:
+            c_rows = hold_rows[country[hold_rows] == c]
+            sel = np.flatnonzero(country[s1_idx[h]] == c)
+            mc = evaluate_rows(pairs.iloc[h[sel]], labels[h[sel]], np.flatnonzero(kept[sel]),
+                               n_true, c_rows)
+            per_country.append(f"{mc['f05']:.4f} / {mc['candidates_per_s1']:.2f}")
+        print(f"  {top_n:>5d} {min_prob:>5.2f} {predict.format_threshold(threshold):>5s}  "
+              f"{m['f05']:.4f} {m['precision']:.4f} {m['recall']:.4f} {m['candidate_recall']:>8.4f}"
+              f"            {_size_stats(s1_idx[h], hold_rows)}  | " + " | ".join(per_country))
+        results.append({"top_n": top_n, "min_prob": min_prob, "threshold": threshold,
+                        **{k: m[k] for k in ("f05", "precision", "recall",
+                                             "candidate_recall", "candidates_per_s1")}})
+    return results
+
+
+def report_test_prune_sizes(s1: pd.DataFrame, pairs: pd.DataFrame) -> None:
+    """
+    Test candidates per S1 (overall and per country) under each sweep setting.
+
+    Args:
+        s1: Test S1 frame.
+        pairs: Pruned test pairs with s1_idx and pruner_prob.
+    """
+    country = s1["country_norm"].to_numpy(dtype=object)
+    rows = np.arange(len(s1))
+    countries = sorted(set(country))
+    print("\n[prune sweep] Test candidates per S1 under stricter pruning "
+          "(mean p90 p99 max)")
+    print(f"  {'top-N':>5s} {'min-p':>5s}  {'all':>20s}  "
+          + "  ".join(f"{c:>20s}" for c in countries))
+    s1_idx = pairs["s1_idx"].to_numpy()
+    for top_n, min_prob in _sweep_settings():
+        kept = s1_idx[_prune_mask(pairs, top_n, min_prob)]
+        print(f"  {top_n:>5d} {min_prob:>5.2f}  {_size_stats(kept, rows):>20s}  "
+              + "  ".join(f"{_size_stats(kept, rows[country == c]):>20s}" for c in countries))
+
+
 def run_validate(sample_s1: int = None, verbose: bool = True) -> float:
     """
     Validation: fit on 80% of train S1 entities, score the untouched 20%.
@@ -503,6 +642,10 @@ def run_validate(sample_s1: int = None, verbose: bool = True) -> float:
                           fitted["threshold"])
     metrics = evaluate_rows(hold_pairs, hold_labels, keep, data["n_true_by_row"], hold_rows)
     by_country = report_by_country(data, hold_pairs, hold_labels, keep, hold_rows)
+    sweep = None
+    if config.PRUNE_SWEEP:
+        sweep = report_prune_sweep(data, pairs, labels, dev, hold, fitted, scores,
+                                   dev_rows, hold_rows)
 
     if config.WRITE_ERROR_DUMP:
         path = os.path.join(config.MODEL_DIR, "holdout_errors.tsv")
@@ -529,7 +672,7 @@ def run_validate(sample_s1: int = None, verbose: bool = True) -> float:
         "stage1": cand["stage1"], "stage2": cand["stage2"],
         "oof_f05": fitted["oof_f05"], "threshold": fitted["threshold"],
         "num_boost_round": fitted["num_boost_round"], "n_features": len(names),
-        "elapsed_s": round(elapsed, 1),
+        "prune_sweep": sweep, "elapsed_s": round(elapsed, 1),
     })
     return metrics["f05"]
 
@@ -654,6 +797,8 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     test = load_split("test", verbose=verbose)
     tcand = build_candidates(test, pruner=pruner, verbose=verbose)
     pairs = tcand["pairs"]
+    if config.PRUNE_SWEEP:
+        report_test_prune_sizes(test["s1"], pairs)
     X_test, test_names = stage3_features(test, pairs, verbose)
     if test_names != names:
         raise RuntimeError("Train and test feature columns differ — check config.")
