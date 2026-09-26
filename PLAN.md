@@ -195,18 +195,23 @@ The threshold is re-tuned automatically on every run, so a combination never get
 
 ### Idea list
 
-**Baseline to beat** (Kaggle, `--mode validate --sample-s1 100000`, 100k train S1 vs **all 10.3M S2/S3**, 17 min, `dhruv` @ 80cea9e = main + transliteration). **Every experiment: same `SAMPLE_S1 = 100_000`, compare to the bold row.**
+**Baseline to beat** (Kaggle, `--mode validate --sample-s1 100000`, 100k train S1 vs **all 10.3M S2/S3**, 20 min, `dhruv` @ 6924198 = lavya 7588b67 + address canonicalization + sorted-word name blocker + address blocker). **Every experiment: same `SAMPLE_S1 = 100_000`, compare to the bold row.**
 
 | Holdout F0.5 | P / R | Cands per S1 (stage 2 / stage 1) | Candidate recall (stage 2 / stage 1) | India / US F0.5 | Threshold |
 |---|---|---|---|---|---|
-| **0.9532** (all-empty 0.057) | 0.976 / 0.908 | 5.96 / 35.3 | 0.950 / 0.955 | 0.941 / 0.961 | 0.71 |
+| **0.9595** (all-empty 0.057), OOF 0.9586 | 0.979 / 0.921 | 4.97 / 44.4 | 0.950 / 0.962 | 0.948 / 0.967 | 0.69 |
+| 0.9559 — `lavya` @ 7588b67 (lambda_l2=1, prune 8/0.03) | | 4.92 / 35.3 | | 0.946 / 0.962 | |
+| 0.9532 — `dhruv` @ 80cea9e (main + transliteration) | 0.976 / 0.908 | 5.96 / 35.3 | 0.950 / 0.955 | 0.941 / 0.961 | 0.71 |
 | 0.9343 — first baseline, before transliteration (20k S1) | 0.964 / 0.877 | 6.16 / 35.4 | 0.935 / 0.941 | 0.905 / 0.952 | 0.69 |
 
 Leaderboard: `sub-d2-1` (same code, trained on 300k S1) = **0.946** public. With India 0.941 / US 0.961 and the test
 mix (India 47%, US 38%, France 15%) that puts **France ≈ 0.91** — fine; **India is the biggest lever** (47% of test,
 lowest score, candidate recall 0.932 vs US 0.963).
 
-What it says: **blocking is still the bottleneck** — 4.5% of true matches never become candidates (the model
+6924198 prune sweep (same run, approximate): 8/0.05 → 0.9592 at 4.70 cands/S1, 7/0.05 → 0.9590 at 4.63.
+Pruning now loses 1.2% of true pairs (stage 1 0.962 → stage 2 0.950), blocking 3.8%.
+
+What the 80cea9e run said: **blocking is still the bottleneck** — 4.5% of true matches never become candidates (the model
 can't recover those), pruning only loses 0.5% more. The `name` blocker barely helps at full scale
 (recall 0.60, ~3k pairs found by it alone) because `BLOCKING_MAX_DF = 2000` drops most name terms
 when there are 5M records. **India is weaker at every stage.**
