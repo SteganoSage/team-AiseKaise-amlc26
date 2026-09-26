@@ -73,6 +73,22 @@ Fits on all training data, then writes:
 
 and runs `utils/validate_submission.py` on them automatically (must print `PASS`).
 
+For lower peak memory on Kaggle, run the two halves as separate processes (or
+separate notebook runs) using the same `--model-dir`:
+
+```bash
+python code/business_entity_resolution/src/run_pipeline.py --mode train_only \
+  --data-dir /kaggle/input/<dataset>/dataset \
+  --output-dir /kaggle/working/output --model-dir /kaggle/working/models
+
+python code/business_entity_resolution/src/run_pipeline.py --mode predict_only \
+  --data-dir /kaggle/input/<dataset>/dataset \
+  --output-dir /kaggle/working/output --model-dir /kaggle/working/models
+```
+
+`train_only` saves the matcher, pruner, threshold, and feature-state files;
+`predict_only` loads them and writes the same two validated output files.
+
 Every mode saves its numbers to `models/run_info_<mode>.json` — copy them into
 `submissions/LOG.md` and PR descriptions.
 

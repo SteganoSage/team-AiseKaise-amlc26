@@ -30,6 +30,9 @@ Modes:
             it. Our stand-in for the unseen test country (France).
 - test:     Fit on all train data, predict the test set, write output/*.tsv
             and run utils/validate_submission.py.
+- train_only: Fit on train data and save model artifacts for a later
+              predict_only run.
+- predict_only: Load saved train artifacts and predict on the test set.
 
 Blocking and features run once over all S1 records of a split (rank features
 compare each pair with its competitors); modes then select pairs by S1.
@@ -830,9 +833,10 @@ def _exec_predict() -> None:
     os.execv(sys.executable, cmd)
 
 
-def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
+def run_test(train_sample_s1: int = None, verbose: bool = True,
+             predict_after_training: bool = True) -> None:
     """
-    Fit on train data → predict the test set → write outputs → validate.
+    Fit on train data and optionally predict the test set.
 
     The training half saves the models and a small state file, then (with
     config.TEST_FRESH_PROCESS) hands over to a fresh process for the test half
@@ -842,10 +846,12 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
         train_sample_s1: Train on this many random train S1 records (all
             S2/S3 kept) instead of all of them. Every test S1 is always scored.
         verbose: Whether to print progress.
+        predict_after_training: Whether to continue into test prediction after
+            saving the train artifacts.
     """
     start_time = time.time()
     print("=" * 70)
-    print("TEST MODE")
+    print("TEST MODE" if predict_after_training else "TRAIN-ONLY MODE")
     print("=" * 70)
 
     # ── Train ──
@@ -877,6 +883,11 @@ def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
         pickle.dump(state, f)
     del data, cand, X, fitted, bundle, extra
     gc.collect()
+
+    if not predict_after_training:
+        print("\n[train] Training artifacts saved; run with --mode predict_only "
+              "to score the test set.")
+        return
 
     if config.TEST_FRESH_PROCESS:
         _exec_predict()   # does not return
@@ -970,10 +981,11 @@ def main():
     """Main entry point for the pipeline."""
     parser = argparse.ArgumentParser(description="Business Entity Resolution Pipeline")
     parser.add_argument(
-        "--mode", choices=["validate", "loco", "test", "predict"], required=True,
+        "--mode", choices=["validate", "loco", "test", "train_only", "predict", "predict_only"], required=True,
         help="'validate' = local F0.5 on a train holdout; 'loco' = leave one "
              "country out; 'test' = train, then predict on the test set; "
-             "'predict' = test half only, with the models a 'test' run saved",
+             "'train_only' = save train artifacts; 'predict_only' = test half "
+             "only using saved train artifacts",
     )
     parser.add_argument("--data-dir", help="Folder with train/ and test/ (default: <repo>/dataset)")
     parser.add_argument("--output-dir", help="Where to write the TSVs (default: <repo>/output)")
@@ -1009,7 +1021,9 @@ def main():
         run_loco(args.sample_s1)
     elif args.mode == "test":
         run_test(args.train_sample_s1)
-    elif args.mode == "predict":
+    elif args.mode == "train_only":
+        run_test(args.train_sample_s1, predict_after_training=False)
+    elif args.mode in ("predict", "predict_only"):
         run_predict()
 
 
