@@ -112,12 +112,14 @@ SNAP_TO_REFERENCE = True
 # ──────────────────────────────────────────────────────────────────────
 
 # Hashed TF-IDF over word 1-2 grams, per source, searched per country:
-#   "name":     name_core
+#   "name":     name_core, words sorted alphabetically (word-order swaps)
 #   "combined": name_norm + address_norm
 #   "address":  address_norm only (finds records whose name is garbled but
-#               whose house number + street match; 0 = off)
+#               whose house number + street match; 0 = off). Slice test-like
+#               run: F0.5 0.9673 → 0.9682, stage-1 recall 0.9810 → 0.9827,
+#               same final candidates per S1 (the pruner caps them).
 # Top-K per blocker per source per S1 entity.
-BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 0}
+BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 10}
 BLOCKING_TOP_K_EMBEDDING = 10
 
 # Terms (words or word pairs) found in more than this many S2/S3 records of
@@ -147,8 +149,21 @@ BLOCK_BY_COUNTRY = True
 # sets per S1 rank higher in the final evaluation, so this is tuned for
 # "as few as possible without losing true matches".
 
-PRUNE_TOP_N = 10          # keep at most this many candidates per S1 (both sources)
-PRUNE_MIN_PROB = 0.01     # ...and only those with pruner probability ≥ this
+# Sweep on 100k validate (7078791): 10/0.01 → F0.5 0.9562, 5.95 cands/S1;
+# 8/0.03 → 0.9559, 4.92 cands/S1 (-17%). Fewer than ~7 per S1 costs F0.5.
+# Confirmed by a real 100k validate on e6d2766: holdout 0.9559, OOF 0.9556,
+# 4.92 cands/S1, India 0.9463 / US 0.9624.
+PRUNE_TOP_N = 8           # keep at most this many candidates per S1 (both sources)
+PRUNE_MIN_PROB = 0.03     # ...and only those with pruner probability ≥ this
+
+# Report-only sweep of stricter pruning settings (candidate_pairs.tsv size
+# counts for the final ranking). --mode validate replays each (top-N,
+# min-prob) setting on the run's own scores: re-tunes the threshold on OOF and
+# prints holdout F0.5 / candidates per S1 by country. --mode test prints the
+# test candidates per S1 each setting would give. Never changes the outputs.
+PRUNE_SWEEP = True
+PRUNE_SWEEP_TOP_N = (6, 7, 8)
+PRUNE_SWEEP_MIN_PROB = (0.03, 0.05, 0.1)
 PRUNE_FOLDS = 2           # out-of-fold pruning on train (by S1 entity)
 PRUNE_ROUNDS = 200        # boosting rounds for the pruner
 PRUNE_MAX_TRAIN_PAIRS = 20_000_000  # subsample S1 entities above this
@@ -193,8 +208,14 @@ FEATURE_GROUPS = {
     "tfidf": True,      # blocking TF-IDF cosines (name, name+address) + their ranks
     "numbers": True,    # overlap of all numbers in the address
     "structure": True,  # postal code / house number / country / lengths / missing / source
-    "rank": True,       # rank + gap to best within the S1's candidates and the
-                        # candidate's S1s, mutual best, candidate counts
+    "rank": True,       # rank + gap to best within the S1's candidates, candidate count
+    # Rank / gap among the S1s that share a candidate, mutual best, S1s per
+    # candidate. Their values depend on how many S1 records are loaded (test
+    # scores all test S1, training uses a --train-sample-s1 sample). Measured
+    # like test on an Iowa+Rajasthan slice (train on 15% of S1, score the rest
+    # with all S1 loaded): they hurt the unregularized LightGBM (0.9655 on vs
+    # 0.9679 off) but help the current one (lambda_l2=1): 0.9684 on vs 0.9673 off.
+    "cand_context": True,
     "blockers": True,   # which blockers produced the pair
     "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)
@@ -217,6 +238,11 @@ LGBM_PARAMS = {
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
     "min_child_samples": 20,
+    # Regularization: without it single trees made outsized corrections (train
+    # loss rose after ~300 rounds, CV folds stopped at 144-635 rounds). 100k
+    # validate: holdout F0.5 0.9532 -> 0.9564, folds 588-752 rounds.
+    "lambda_l2": 1.0,
+    "min_sum_hessian_in_leaf": 1.0,
     "verbose": -1,
     "seed": RANDOM_SEED,
     "n_jobs": N_JOBS,
