@@ -164,6 +164,12 @@ PRUNE_MIN_PROB = 0.03     # ...and only those with pruner probability ≥ this
 PRUNE_SWEEP = True
 PRUNE_SWEEP_TOP_N = (6, 7, 8)
 PRUNE_SWEEP_MIN_PROB = (0.03, 0.05, 0.1)
+PRUNE_PREDICT_CHUNK = 5_000_000  # test: pairs per slice of pruner features + scores
+
+# --mode test: after training, restart as a fresh process for the test half
+# (os.execv, same PID and log), so the test split does not sit on top of the
+# memory training left behind. False = keep both halves in one process.
+TEST_FRESH_PROCESS = True
 PRUNE_FOLDS = 2           # out-of-fold pruning on train (by S1 entity)
 PRUNE_ROUNDS = 200        # boosting rounds for the pruner
 PRUNE_MAX_TRAIN_PAIRS = 20_000_000  # subsample S1 entities above this
@@ -185,6 +191,26 @@ PRUNER_PARAMS = {
 # Embeddings (optional: needs sentence-transformers + model download,
 # a GPU is recommended — use on Kaggle)
 # ──────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────
+# Optional transformer cross-encoder (crossenc.py)
+# ──────────────────────────────────────────────────────────────────────
+
+# Fine-tune a small multilingual transformer on the reserved share of training
+# S1 entities and add its match probability (plus its rank / gap within each
+# S1's candidates) to the stage-3 features. Needs a CUDA GPU; without one it
+# is off for the whole run.
+USE_CROSSENC = True
+CROSSENC_MODEL_NAME = "intfloat/multilingual-e5-small"  # MIT, 118M params (MODELS.md)
+CROSSENC_TRAIN_FRAC = 0.2         # share of training S1 reserved to fine-tune it
+CROSSENC_MAX_TRAIN_PAIRS = 400_000
+CROSSENC_EPOCHS = 2
+CROSSENC_LR = 3e-5
+CROSSENC_TRAIN_BATCH = 64
+CROSSENC_MAX_LENGTH = 80          # tokens for both "name | address" texts together
+CROSSENC_SCORE_BATCH = 512
+CROSSENC_SCORE_CHUNK = 1_000_000  # pairs whose texts are built at once when scoring
+CROSSENC_ALLOW_CPU = False        # tests on tiny data only
 
 # When True: an extra embedding kNN blocker (BLOCKING_TOP_K_EMBEDDING per
 # source) and embedding-cosine pair features.
@@ -219,6 +245,14 @@ FEATURE_GROUPS = {
     "blockers": True,   # which blockers produced the pair
     "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)
+    # Ideas from the record-linkage literature (Fellegi-Sunter, Ditto/DeepMatcher
+    # feature lists). 100k validate on lavya 7588b67 + these three groups:
+    # holdout F0.5 0.9559 → 0.9633 (precision 0.983), same candidates.
+    "frequency": True,  # how many S1 / S2+S3 records share the name / address
+                        # (whole split, before S1 sampling)
+    "cross": True,      # name × address product / min / max, exact flags,
+                        # first / last name word equal
+    "char_ngram": True, # character 3-gram cosine of name_core (typos)
 }
 
 # Pairs per chunk when computing features / cosines (memory bound)
