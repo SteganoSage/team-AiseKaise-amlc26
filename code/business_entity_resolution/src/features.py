@@ -26,6 +26,11 @@ on/off in config.FEATURE_GROUPS for ablations:
 - cross:     name × address interactions (product, min, max), exact name /
              address flags, first / last name word equal.
 - char_ngram: character 3-gram cosine of name_core (typo tolerant).
+- sibling:   how similar a candidate is to the OTHER candidates of the same
+             S1, weighted by their pruner probability. The ~3.5 true matches
+             of an S1 resemble each other (same business, often the same
+             vendor's format), while a look-alike does not agree with them,
+             so a garbled record close to a confident sibling is likely true.
 
 All features are country-agnostic (no one-hot country) so France generalizes.
 """
@@ -432,6 +437,78 @@ def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
     return out
 
 
+def sibling_features(tgt: pd.DataFrame, s1_idx: np.ndarray, tgt_idx: np.ndarray,
+                     prob: np.ndarray, chunk: int = 2_000_000) -> dict:
+    """
+    Similarity of each candidate to the other candidates of the same S1.
+
+    Every unordered pair of candidates sharing an S1 (≤ PRUNE_TOP_N per S1, so
+    ~12 pairs per S1) is compared on name_core and address_norm with
+    token_set_ratio. For candidate p and its siblings q:
+    - sib_name_max / sib_addr_max: best name / address similarity to any q
+    - sib_both_max: best mean of the two
+    - sib_both_wmax: best mean × pruner probability of q (confident siblings)
+    - sib_support: Σ over q of pruner probability × mean similarity
+    - sib_top_both: mean similarity to the most confident other candidate
+    - sib_n_close: number of siblings with mean similarity ≥ 80
+    Candidates alone in their S1 get 0 everywhere.
+
+    Args:
+        tgt: Normalized S2 + S3 frame.
+        s1_idx: S1 row per pair.
+        tgt_idx: Target row per pair.
+        prob: Pruner probability per pair (out-of-fold on train).
+        chunk: Sibling pairs compared per batch (memory bound).
+
+    Returns:
+        Dict of feature name → float32 array aligned with the pairs.
+    """
+    n = len(s1_idx)
+    out = {k: np.zeros(n, dtype=np.float32) for k in
+           ("sib_name_max", "sib_addr_max", "sib_both_max", "sib_both_wmax",
+            "sib_support", "sib_top_both", "sib_n_close")}
+    if n < 2:
+        return out
+    # All pairs (i, j) of rows that share an S1: sort by S1, compare row k apart
+    order = np.argsort(s1_idx, kind="stable")
+    sorted_s1 = s1_idx[order]
+    max_size = int(np.bincount(s1_idx).max())
+    left, right = [], []
+    for k in range(1, max_size):
+        same = sorted_s1[:-k] == sorted_s1[k:]
+        left.append(order[:-k][same])
+        right.append(order[k:][same])
+    left, right = np.concatenate(left), np.concatenate(right)
+
+    # Most confident OTHER candidate of each pair's S1
+    rank = group_rank(s1_idx, prob)
+    top1 = np.full(int(s1_idx.max()) + 1, -1, dtype=np.int64)
+    top2 = top1.copy()
+    top1[s1_idx[rank == 1]] = np.flatnonzero(rank == 1)
+    top2[s1_idx[rank == 2]] = np.flatnonzero(rank == 2)
+    other_top = np.where(rank == 1, top2[s1_idx], top1[s1_idx])
+
+    for start in range(0, len(left), chunk):
+        i, j = left[start:start + chunk], right[start:start + chunk]
+        name_sim = process.cpdist(take_strings(tgt, "name_core", tgt_idx[i]),
+                                  take_strings(tgt, "name_core", tgt_idx[j]),
+                                  scorer=fuzz.token_set_ratio, workers=-1).astype(np.float32)
+        addr_sim = process.cpdist(take_strings(tgt, "address_norm", tgt_idx[i]),
+                                  take_strings(tgt, "address_norm", tgt_idx[j]),
+                                  scorer=fuzz.token_set_ratio, workers=-1).astype(np.float32)
+        both = (name_sim + addr_sim) / 2.0
+        for a, b in ((i, j), (j, i)):   # each sibling pair informs both sides
+            np.maximum.at(out["sib_name_max"], a, name_sim)
+            np.maximum.at(out["sib_addr_max"], a, addr_sim)
+            np.maximum.at(out["sib_both_max"], a, both)
+            np.maximum.at(out["sib_both_wmax"], a, both * prob[b])
+            np.add.at(out["sib_support"], a, prob[b] * both / 100.0)
+            np.add.at(out["sib_n_close"], a, (both >= 80).astype(np.float32))
+            is_top = other_top[a] == b
+            out["sib_top_both"][a[is_top]] = both[is_top]
+    return out
+
+
 def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFrame,
                          embeddings: dict = None, verbose: bool = True) -> tuple:
     """
@@ -494,6 +571,13 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
         if "pruner_prob" in pairs:
             sims["pruner"] = pairs["pruner_prob"].to_numpy(dtype=np.float32)
         cols.update(rank_features(s1_idx, tgt_idx, sims))
+
+    if groups.get("sibling", False) and "pruner_prob" in pairs:
+        t0 = time.time()
+        cols.update(sibling_features(tgt, s1_idx, tgt_idx,
+                                     pairs["pruner_prob"].to_numpy(dtype=np.float32)))
+        if verbose:
+            print(f"  sibling features: {time.time() - t0:.0f}s")
 
     if groups.get("embedding", True) and embeddings is not None:
         for field in ("name", "full"):

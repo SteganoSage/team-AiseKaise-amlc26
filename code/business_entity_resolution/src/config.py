@@ -218,6 +218,10 @@ FEATURE_GROUPS = {
     "cross": True,      # name × address product / min / max, exact flags,
                         # first / last name word equal
     "char_ngram": True, # character 3-gram cosine of name_core (typos)
+    # Similarity of a candidate to the OTHER candidates of the same S1 (true
+    # matches of one business resemble each other; look-alikes do not), weighted
+    # by pruner probability. Not yet measured (base: llm-advice 27ad884 = 0.9633).
+    "sibling": True,
 }
 
 # Pairs per chunk when computing features / cosines (memory bound)
