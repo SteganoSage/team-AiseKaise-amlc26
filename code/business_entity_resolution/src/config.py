@@ -220,7 +220,8 @@ FEATURE_GROUPS = {
     "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)
     # Ideas from the record-linkage literature (Fellegi-Sunter, Ditto/DeepMatcher
-    # feature lists), not yet measured on a real validate:
+    # feature lists). 100k validate on lavya 7588b67 + these three groups:
+    # holdout F0.5 0.9559 → 0.9633 (precision 0.983), same candidates.
     "frequency": True,  # how many S1 / S2+S3 records share the name / address
                         # (whole split, before S1 sampling)
     "cross": True,      # name × address product / min / max, exact flags,
