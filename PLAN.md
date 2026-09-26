@@ -193,10 +193,17 @@ The threshold is re-tuned automatically on every run, so a combination never get
 
 ### Idea list
 
-**First real numbers** (20k-S1 slice of real train, easier than full data): holdout F0.5 **0.979**
-(all-empty 0.053 — only ~5% of S1s have no match; ~3.5 true links per S1), candidates per S1
-**4.3** (34.7 before pruning), candidate recall 0.983. **India is the weak spot** (candidate recall
-0.968 vs US 0.992). Full-data numbers come from the first Kaggle run.
+**Baseline to beat** (Kaggle, `--mode validate --sample-s1 20000`, 20k train S1 vs **all 10.3M S2/S3**, 12.5 min):
+
+| Holdout F0.5 | P / R | Cands per S1 (stage 2 / stage 1) | Candidate recall (stage 2 / stage 1) | India / US F0.5 | Threshold |
+|---|---|---|---|---|---|
+| **0.9343** (all-empty 0.055) | 0.964 / 0.877 | 6.16 / 35.4 | 0.935 / 0.941 | 0.905 / 0.952 | 0.69 |
+
+What it says: **blocking is the bottleneck** — 5.9% of true matches never become candidates (the model
+can't recover those), pruning only loses 0.6% more. The `name` blocker barely helps at full scale
+(recall 0.56, only 440 pairs found by it alone) because `BLOCKING_MAX_DF = 2000` drops most name terms
+when there are 5M records. **India is weaker at every stage** (Devanagari script is a likely cause).
+Compare every experiment against this row with the same `--sample-s1 20000`.
 
 **Day 1 first moves:** leader → private Kaggle dataset + `00_run_pipeline_kaggle.ipynb` with `MODE="test"`
 (Save & Run All) for the first real upload; one person → #A (full-scale validate on Kaggle, runtime/memory); one person → #2 (read
@@ -207,8 +214,8 @@ The threshold is re-tuned automatically on every run, so a combination never get
 
 | # | Idea | Status | Details |
 |---|---|---|---|
-| A | Full-scale run on Kaggle | todo | `--mode validate --sample-s1 200000`, then full. Note runtime + peak RAM per stage. If stage 1 is slow: lower `BLOCKING_MAX_DF`, raise `BLOCKING_CHUNK_ROWS`. |
-| 1 | Tune blocking + pruning size | todo | `BLOCKING_TOP_K`, `BLOCKING_MAX_DF`, `PRUNE_TOP_N`, `PRUNE_MIN_PROB`. Goal: fewest candidates per S1 that doesn't cost F0.5 (both numbers are ranked). |
+| A | Full-scale run on Kaggle | in progress | 20k-S1 validate done (baseline above). Next: `--mode test --train-sample-s1 300000` for the first upload. Note runtime per stage — the stage-1 lines split hashing vs search time. If stage 1 is slow: lower `BLOCKING_MAX_DF`, raise `BLOCKING_CHUNK_ROWS`. |
+| 1 | **Blocking recall (top priority)** | todo | Stage-1 recall is 0.941. Try `BLOCKING_TOP_K` 10→20, `BLOCKING_MAX_DF` 2000→10000 (slower — watch the new per-blocker timing lines), a name blocker that keeps common terms. Then `PRUNE_TOP_N` / `PRUNE_MIN_PROB` to keep candidates per S1 small. |
 | 2 | Fix what we miss | todo | `holdout_errors.tsv`: `FN_not_candidate` rows = blocking/pruning misses, `FN_scored` = model misses, `FP` = false merges. Fix normalization/features for the biggest patterns. **India first.** |
 | 3 | Indian spellings + **Devanagari** | todo | S3 has Hindi-script names/addresses (`मॉडर्न फाइनेंस`). Try transliteration to Latin in `normalize.py`; PIN `411 001`; Shri/Sri/Shree. |
 | 4 | French normalization | todo | `sarl/sas/eurl`, `R.`/`rue`, `AV`, `bd`, "St" = saint vs street, accents. Check against real French test records (`eda.py --split test`). |

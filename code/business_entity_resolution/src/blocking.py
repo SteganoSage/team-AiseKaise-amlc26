@@ -6,7 +6,10 @@ source (S2, S3) separately, inside the same country:
 
 1. "name" blocker:     TF-IDF on word 1-2 grams of name_core → top-K
 2. "combined" blocker: TF-IDF on word 1-2 grams of name + address → top-K
-3. (optional) "embedding" blocker: multilingual sentence-embedding kNN (GPU)
+3. (optional) "address" blocker: TF-IDF on word 1-2 grams of the address only,
+   so a record whose name is garbled (typos, other script, website form) is
+   still found through a rare house number + street ("8806 alki")
+4. (optional) "embedding" blocker: multilingual sentence-embedding kNN (GPU)
 
 How it scales:
 - HashingVectorizer: no vocabulary to hold in memory (word pairs over
@@ -26,6 +29,7 @@ records when the country is missing or unknown in the target source.
 """
 
 import multiprocessing as mp
+import time
 
 import numpy as np
 import pandas as pd
@@ -36,7 +40,7 @@ from sklearn.preprocessing import normalize as l2_normalize
 import config
 
 # Bit flags recording which blocker(s) produced a candidate pair
-BLOCKER_BITS = {"name": 1, "combined": 2, "embedding": 4}
+BLOCKER_BITS = {"name": 1, "combined": 2, "embedding": 4, "address": 8}
 
 # Worker-process globals for the sparse top-K (inherited through fork)
 _SHARED = {}
@@ -52,7 +56,7 @@ def blocker_texts(frame: pd.DataFrame, blocker: str) -> list:
 
     Args:
         frame: Normalized records (normalize.normalize_frame output).
-        blocker: "name" or "combined".
+        blocker: "name", "combined" or "address".
 
     Returns:
         List of strings, one per record.
@@ -61,6 +65,8 @@ def blocker_texts(frame: pd.DataFrame, blocker: str) -> list:
         return frame["name_core"].tolist()
     if blocker == "combined":
         return (frame["name_norm"] + " " + frame["address_norm"]).tolist()
+    if blocker == "address":
+        return frame["address_norm"].tolist()
     raise ValueError(f"Unknown blocker {blocker}")
 
 
@@ -351,13 +357,23 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
 
     matrices, found = {}, []
     for blocker, k in config.BLOCKING_TOP_K.items():
+        if not k:
+            continue  # blocker switched off (top-K 0)
+        t0 = time.time()
         Q, T = tfidf_pair(blocker_texts(s1, blocker), blocker_texts(tgt, blocker), n_jobs)
+        t1 = time.time()
         matrices[blocker] = (Q, T, k)
         for s1_rows, tgt_rows in partitions:
             q, t, _, _ = sparse_topk(Q[s1_rows], T[tgt_rows], k, n_jobs)
             found.append((blocker, s1_rows[q], tgt_rows[t]))
+        if verbose:
+            # Terms kept per record = what survives BLOCKING_MAX_DF (drives search cost and recall)
+            print(f"      {blocker:>9s}: tf-idf {t1 - t0:5.0f}s, search {time.time() - t1:5.0f}s | "
+                  f"terms kept per S1 {Q.nnz / max(Q.shape[0], 1):.1f}, "
+                  f"per {source} {T.nnz / max(T.shape[0], 1):.1f}")
 
     if embeddings is not None:
+        t0 = time.time()
         e_s1 = embeddings["s1"]
         e_tgt = embeddings["tgt"][tgt["tgt_row"].to_numpy()]
         k = config.BLOCKING_TOP_K_EMBEDDING
@@ -365,6 +381,9 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
         for s1_rows, tgt_rows in partitions:
             q, t, _, _ = dense_topk(e_s1[s1_rows], e_tgt[tgt_rows], k)
             found.append(("embedding", s1_rows[q], tgt_rows[t]))
+        if verbose:
+            print(f"      embedding: search {time.time() - t0:5.0f}s")
+    t_union = time.time()
 
     # Union of all blockers: one row per (S1 row, local target row)
     n_local = len(tgt)
@@ -389,6 +408,8 @@ def _block_one_source(s1: pd.DataFrame, tgt: pd.DataFrame, source: str,
         score = rowwise_cosine(Q, T, s1_idx, local_t)
         out[f"score_{blocker}"] = score
         out[f"rank_{blocker}"] = group_rank(s1_idx, score, cap=k + 1)
+    if verbose:
+        print(f"      union + scores for {len(out):,} pairs: {time.time() - t_union:.0f}s")
     return out
 
 
@@ -515,7 +536,7 @@ def report_recall(pairs: pd.DataFrame, labels: np.ndarray, n_true_links: int,
             print(f"  {'blocker':>12s}  {'recall':>7s}  {'only this':>9s}")
             for name, bit in BLOCKER_BITS.items():
                 hit = (mask & bit) > 0
-                if hit.any() or name != "embedding":
+                if hit.any() or config.BLOCKING_TOP_K.get(name):
                     print(f"  {name:>12s}  {hit.sum() / n_true_links:>7.4f}  "
                           f"{int((mask == bit).sum()):>9d}")
     return recall

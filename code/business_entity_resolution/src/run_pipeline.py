@@ -149,6 +149,9 @@ def load_split(split: str, sample_s1: int = None, verbose: bool = True) -> dict:
     tgt = pd.concat([s2.assign(source="S2"), s3.assign(source="S3")], ignore_index=True)
     del s2, s3
     gc.collect()
+    if config.SNAP_TO_REFERENCE:
+        # Uses all S1 records (before sampling) as the vocabulary
+        tgt = normalize.snap_to_reference(tgt, s1, verbose)
 
     if sample_s1 and sample_s1 < len(s1):
         rows = np.sort(np.random.default_rng(config.RANDOM_SEED)
@@ -446,6 +449,8 @@ def save_run_info(mode: str, info: dict) -> None:
     path = os.path.join(config.MODEL_DIR, f"run_info_{mode}.json")
     info = {"mode": mode, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "use_embeddings": config.USE_EMBEDDINGS,
+            "snap_to_reference": config.SNAP_TO_REFERENCE,
+            "top1_threshold": config.TOP1_THRESHOLD,
             "feature_groups": config.FEATURE_GROUPS,
             "blocking_top_k": config.BLOCKING_TOP_K,
             "blocking_max_df": config.BLOCKING_MAX_DF,
@@ -618,11 +623,13 @@ def run_validator() -> None:
         print("  ✗ Validator FAILED — do not upload these files.")
 
 
-def run_test(verbose: bool = True) -> None:
+def run_test(train_sample_s1: int = None, verbose: bool = True) -> None:
     """
-    Fit on all train data → predict the test set → write outputs → validate.
+    Fit on train data → predict the test set → write outputs → validate.
 
     Args:
+        train_sample_s1: Train on this many random train S1 records (all
+            S2/S3 kept) instead of all of them. Every test S1 is always scored.
         verbose: Whether to print progress.
     """
     start_time = time.time()
@@ -631,7 +638,7 @@ def run_test(verbose: bool = True) -> None:
     print("=" * 70)
 
     # ── Train ──
-    data = load_split("train", verbose=verbose)
+    data = load_split("train", train_sample_s1, verbose)
     cand = build_candidates(data, fit_final_pruner=True, verbose=verbose)
     X, names = stage3_features(data, cand["pairs"], verbose)
     fitted = fit_matcher(X, cand["pairs"], cand["labels"], data["n_true_by_row"],
@@ -693,6 +700,7 @@ def run_test(verbose: bool = True) -> None:
         "test_stage1": tcand["stage1"], "test_stage2": tcand["stage2"],
         "test_s1": len(s1), "test_s1_with_match": int(matched_rows.sum()),
         "test_links": int(len(keep)), "n_features": len(names),
+        "train_sample_s1": train_sample_s1,
         "elapsed_s": round(elapsed, 1),
     })
     run_validator()
@@ -713,6 +721,9 @@ def main():
     parser.add_argument("--sample-s1", type=int, default=config.SAMPLE_S1,
                         help="validate/loco: use this many random train S1 records "
                              "(all S2/S3 kept). Default: all")
+    parser.add_argument("--train-sample-s1", type=int, default=config.TRAIN_SAMPLE_S1,
+                        help="test: train on this many random train S1 records "
+                             "(every test S1 is still scored). Default: all")
     parser.add_argument("--embeddings", action="store_true",
                         help="Turn on config.USE_EMBEDDINGS for this run (GPU recommended)")
     parser.add_argument("--no-cache", action="store_true",
@@ -736,7 +747,7 @@ def main():
     elif args.mode == "loco":
         run_loco(args.sample_s1)
     elif args.mode == "test":
-        run_test()
+        run_test(args.train_sample_s1)
 
 
 if __name__ == "__main__":
