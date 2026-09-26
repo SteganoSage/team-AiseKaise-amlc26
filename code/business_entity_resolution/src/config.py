@@ -147,8 +147,10 @@ BLOCK_BY_COUNTRY = True
 # sets per S1 rank higher in the final evaluation, so this is tuned for
 # "as few as possible without losing true matches".
 
-PRUNE_TOP_N = 10          # keep at most this many candidates per S1 (both sources)
-PRUNE_MIN_PROB = 0.01     # ...and only those with pruner probability ≥ this
+# Sweep on 100k validate (7078791): 10/0.01 → F0.5 0.9562, 5.95 cands/S1;
+# 8/0.03 → 0.9559, 4.92 cands/S1 (-17%). Fewer than ~7 per S1 costs F0.5.
+PRUNE_TOP_N = 8           # keep at most this many candidates per S1 (both sources)
+PRUNE_MIN_PROB = 0.03     # ...and only those with pruner probability ≥ this
 
 # Report-only sweep of stricter pruning settings (candidate_pairs.tsv size
 # counts for the final ranking). --mode validate replays each (top-N,
@@ -156,8 +158,8 @@ PRUNE_MIN_PROB = 0.01     # ...and only those with pruner probability ≥ this
 # prints holdout F0.5 / candidates per S1 by country. --mode test prints the
 # test candidates per S1 each setting would give. Never changes the outputs.
 PRUNE_SWEEP = True
-PRUNE_SWEEP_TOP_N = (4, 5, 6, 7, 8, 10)
-PRUNE_SWEEP_MIN_PROB = (0.01, 0.03, 0.1, 0.2)
+PRUNE_SWEEP_TOP_N = (6, 7, 8)
+PRUNE_SWEEP_MIN_PROB = (0.03, 0.05, 0.1)
 PRUNE_FOLDS = 2           # out-of-fold pruning on train (by S1 entity)
 PRUNE_ROUNDS = 200        # boosting rounds for the pruner
 PRUNE_MAX_TRAIN_PAIRS = 20_000_000  # subsample S1 entities above this
