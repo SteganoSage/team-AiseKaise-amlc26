@@ -116,6 +116,8 @@ LEGAL_SUFFIXES = [
     "sarl",
     "sas",
     "sasu",
+    "eirl",
+    "ei",  # entrepreneur individuel
     "sa",
     "eurl",
     "sci",
@@ -377,6 +379,13 @@ def transliterate_indic(text: str) -> str:
     return "".join(out)
 
 
+# Dotted acronyms: "S.A.R.L.", "S.A.S.U.", "L.L.C." (single letters with dots)
+DOTTED_ACRONYM_RE = re.compile(r"\b(?:[A-Za-z]\.){2,}[A-Za-z]?\.?")
+
+# "St-" / "St.-" / "Ste-" joined to a word by a hyphen is Saint/Sainte
+# ("St.-Herblain" = "Saint-Herblain"), not "street" / "suite"
+SAINT_RE = re.compile(r"\b[Ss][Tt]([Ee])?\.?\s*-(?=\s*[A-Za-z])")
+
 # Zero-width joiners split Malayalam/Devanagari words when they become spaces
 ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\ufeff]")
 
@@ -385,8 +394,9 @@ def normalize_text(text: str) -> str:
     """
     Apply base normalization to any text field.
 
-    Steps: Indic scripts → Latin → lowercase → NFKD + strip accents
-    → & → and → strip punctuation → collapse whitespace → strip.
+    Steps: join dotted acronyms (S.A.R.L. → SARL) → St-/Ste- → saint-/sainte-
+    → Indic scripts → Latin → lowercase → NFKD + strip accents → & → and
+    → strip punctuation → collapse whitespace → strip.
 
     Args:
         text: Raw text string.
@@ -398,6 +408,8 @@ def normalize_text(text: str) -> str:
         return ""
 
     text = ZERO_WIDTH_RE.sub("", text)
+    text = DOTTED_ACRONYM_RE.sub(lambda m: m.group(0).replace(".", ""), text)
+    text = SAINT_RE.sub(lambda m: "sainte-" if m.group(1) else "saint-", text)
     if INDIC_RE.search(text):
         text = transliterate_indic(text)
     text = text.lower()
@@ -428,24 +440,51 @@ def expand_abbreviations(text: str, abbrev_dict: dict) -> str:
     return " ".join(expanded)
 
 
-def normalize_name(name: str) -> str:
+def normalize_name(name: str, country: str = "") -> str:
     """
     Normalize a business name.
 
-    Applies base normalization, then expands name abbreviations.
+    Applies base normalization, then expands name abbreviations. A
+    parenthesised word equal to the record's own country ("No Fetes (France)
+    SAS", "Hotels Marketing (India) LLP") is dropped, and a word repeated
+    back to back ("Inc Inc") is kept once.
 
     Args:
         name: Raw business name string.
+        country: Raw country of the record (optional).
 
     Returns:
         Normalized business name.
     """
+    if country and "(" in name:
+        own = normalize_text(country)
+        name = PAREN_RE.sub(lambda m: " " if normalize_text(m.group(1)) == own else m.group(0), name)
     name = WEB_JUNK_RE.sub(" ", name)
     name = ID_CODE_RE.sub(" ", name)
     text = normalize_text(name)
     text = " ".join(_fix_zero_for_o(t) for t in text.split())
     text = expand_abbreviations(text, NAME_ABBREVIATIONS)
-    return text
+    return _drop_repeats(text)
+
+
+PAREN_RE = re.compile(r"\(([^()]*)\)")
+
+
+def _drop_repeats(text: str) -> str:
+    """
+    Keep one copy of a token repeated back to back ("25 rue rue albert" → "25 rue albert").
+
+    Args:
+        text: Normalized text.
+
+    Returns:
+        Text without consecutive duplicate tokens.
+    """
+    out = []
+    for token in text.split():
+        if not out or out[-1] != token:
+            out.append(token)
+    return " ".join(out)
 
 
 # Website / handle wrappers around a name: "reliablethayer.com", "@nationalheritage",
@@ -532,10 +571,14 @@ def normalize_address(address: str) -> str:
     Returns:
         Normalized business address.
     """
-    text = normalize_text(HALF_RE.sub(" ", address))
+    text = normalize_text(NUMERO_RE.sub(" ", HALF_RE.sub(" ", address)))
     text = expand_abbreviations(text, ADDRESS_ABBREVIATIONS)
     text = expand_abbreviations(text, ORDINAL_WORDS)
-    return " ".join(t for t in text.split() if t not in NULL_TOKENS)
+    return _drop_repeats(" ".join(t for t in text.split() if t not in NULL_TOKENS))
+
+
+# "N°23", "Nº 257" (numéro): otherwise "n" becomes "north" and "nº" becomes "no"
+NUMERO_RE = re.compile(r"\b[Nn]\s*[°º]\s*(?=\d)")
 
 
 # "516 1/2 201st Avenue": the half adds a spurious "1" and "2" to the numbers
@@ -641,7 +684,7 @@ def _normalize_chunk(chunk: tuple) -> dict:
     names, addresses, countries = chunk
     out = {col: [] for col in NORMALIZED_COLUMNS}
     for name, address, country in zip(names, addresses, countries):
-        name_norm = normalize_name(name or "")
+        name_norm = normalize_name(name or "", country or "")
         address_norm = normalize_address(address or "")
         out["name_norm"].append(name_norm)
         out["name_core"].append(extract_name_core(name_norm))
