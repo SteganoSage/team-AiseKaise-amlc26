@@ -43,6 +43,11 @@ EASY_SAMPLE = 0.03     # share of out-of-band pairs added to the training set
 TAG = ""
 
 
+def _amp_dtype():
+    """bfloat16 where the GPU supports it (A100/L4), else float16 (T4 on Kaggle/Colab)."""
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
 def model_dir():
     return work(stage_dir("models", TAG), "ce", "x").parent
 
@@ -91,19 +96,24 @@ def train(log):
     steps = EPOCHS * math.ceil(len(tr_idx) / BATCH)
     sched = get_linear_schedule_with_warmup(opt, int(0.05 * steps), steps)
     rng = np.random.default_rng(0)
+    amp = _amp_dtype()
+    # float16 needs loss scaling to avoid underflowing gradients; bfloat16 does not
+    scaler = torch.cuda.amp.GradScaler(enabled=amp == torch.float16)
+    log(f"mixed precision: {amp}")
     step = 0
     for epoch in range(EPOCHS):
         model.train()
         for idx in _batches(len(tr_idx), BATCH, rng.permutation(tr_idx)):
             enc = tok([ta[i] for i in idx], [tb[i] for i in idx], truncation=True,
                       max_length=MAXLEN, padding=True, return_tensors="pt").to("cuda")
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=amp):
                 logits = model(**enc).logits.squeeze(-1)
             loss = F.binary_cross_entropy_with_logits(logits.float(),
                                                       torch.tensor(y[idx], device="cuda"))
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+            scaler.step(opt); scaler.update(); sched.step(); opt.zero_grad(set_to_none=True)
             step += 1
             if step % 2000 == 0:
                 log(f"  epoch {epoch} step {step}/{steps} loss {loss.item():.4f}")
@@ -124,7 +134,7 @@ def _predict(model, tok, ta, tb, batch=2048):
     for idx in _batches(len(order), batch, order):
         enc = tok([ta[i] for i in idx], [tb[i] for i in idx], truncation=True,
                   max_length=MAXLEN, padding=True, return_tensors="pt").to("cuda")
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=_amp_dtype()):
             out[idx] = torch.sigmoid(model(**enc).logits.squeeze(-1).float()).cpu().numpy()
     return out
 

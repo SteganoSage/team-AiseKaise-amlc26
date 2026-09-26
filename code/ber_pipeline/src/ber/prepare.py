@@ -90,7 +90,7 @@ def main():
     # exist, and the full-size exploded frame crashed polars on Windows.
     recs = load_records("train")
     aliases = learn_state_aliases(
-        pl.read_parquet(s1_path), recs.sample(3_000_000, seed=0), load_gt_pairs())
+        pl.read_parquet(s1_path), recs.sample(min(3_000_000, len(recs)), seed=0), load_gt_pairs())
     work("norm", "state_aliases.json").write_text(
         json.dumps(aliases, ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"state aliases: { {c: len(a) for c, a in aliases.items()} }")

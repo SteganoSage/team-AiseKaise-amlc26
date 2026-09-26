@@ -1,0 +1,14 @@
+# ber pipeline (code/ber_pipeline/src). Versions below are the ones the pipeline
+# was smoke-tested with on fake data (26 Sep); torch/transformers only for the
+# cross-encoder step (GPU).
+polars==1.44.2
+sparse_dot_topn==1.2.0
+anyascii==0.3.3
+rapidfuzz==3.10.1
+lightgbm==4.5.0
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.2
+pyarrow==17.0.0
+torch>=2.1
+transformers>=4.40

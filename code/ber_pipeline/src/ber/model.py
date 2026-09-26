@@ -19,6 +19,7 @@ Run from src/:  python -m ber.model stage1
 """
 import argparse
 import json
+import os
 import time
 
 import lightgbm as lgb
@@ -39,8 +40,64 @@ PARAMS = dict(
 )
 N_FOLDS = 3
 MAX_ROUNDS = 4000
-TRAIN_FRAC = 0.6  # share of (kept, non-cross-encoder) training S1 entities the LightGBMs are fitted on (memory: ~50M rows)
+TRAIN_FRAC = float(os.environ.get("BER_TRAIN_FRAC", 0.6))  # share of (kept, non-cross-encoder) training S1 entities the LightGBMs are fitted on (memory: ~50M rows)
 TAG = ""  # dev runs set this from --tag; selects feat_<tag>/ and models_<tag>/
+
+# Optional trimming of the final candidate set (candidate_pairs.tsv size counts
+# in the final ranking): keep, per S1 entity, only the CAND_TOP_N pairs with the
+# highest first-stage probability p1 and p1 >= CAND_MIN_P1; the second-stage
+# model then scores (and the decision/output uses) only those. 0 = off (all
+# blocked pairs are candidates, as originally). stage2 always prints what each
+# setting would cost on out-of-fold predictions (trim report).
+CAND_TOP_N = int(os.environ.get("BER_CAND_TOP_N", 0))
+CAND_MIN_P1 = float(os.environ.get("BER_CAND_MIN_P1", 0.0))
+TRIM_REPORT = [(n, m) for n in (0, 15, 10, 8, 6) for m in (0.0, 0.01, 0.03)]
+
+
+def trim_mask(df, top_n=None, min_p1=None):
+    """Boolean mask of the pairs kept by candidate trimming (all True when off).
+
+    Args:
+        df: Pairs with s1_id and p1 (first-stage probability).
+        top_n: Keep at most this many pairs per S1 by p1 (0 = no cap).
+        min_p1: Keep only pairs with p1 >= this.
+
+    Returns:
+        numpy bool array aligned with df.
+    """
+    top_n = CAND_TOP_N if top_n is None else top_n
+    min_p1 = CAND_MIN_P1 if min_p1 is None else min_p1
+    keep = pl.col("p1") >= min_p1
+    if top_n:
+        keep = keep & (pl.col("p1").rank("ordinal", descending=True).over("s1_id") <= top_n)
+    return df.select(keep.alias("k"))["k"].to_numpy()
+
+
+def trim_report(df, oof, log):
+    """Out-of-fold macro F0.5 and candidates per S1 for each trimming setting.
+
+    For each (top-N, min p1): drop the trimmed pairs, re-pick the best decision
+    rule on the remaining out-of-fold probabilities and score it (true matches
+    that were trimmed count as misses).
+    """
+    ids = df["s1_id"].unique()
+    truth = load_gt_pairs().join(ids.to_frame(), on="s1_id")
+    pred_all = df.select("s1_id", "rec_id").with_columns(p=pl.Series(oof))
+    rows = []
+    for top_n, min_p1 in TRIM_REPORT:
+        m = trim_mask(df, top_n, min_p1)
+        pred = pred_all.filter(pl.Series(m))
+        best = 0.0
+        for t in (0.4, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8):
+            best = max(best, f05_macro(decide(pred, "threshold", t=t), truth, ids))
+        for miss in (0.0, 0.1, 0.25):
+            best = max(best, f05_macro(decide(pred, "expected_f", miss=miss), truth, ids))
+        kept_true = pred.join(truth, on=["s1_id", "rec_id"]).height
+        rows.append({"top_n": top_n or "all", "min_p1": min_p1, "f05": round(best, 5),
+                     "cands_per_s1": round(len(pred) / max(len(ids), 1), 2),
+                     "cand_recall": round(kept_true / max(len(truth), 1), 4)})
+    with pl.Config(tbl_rows=30):
+        log(f"trim report (out-of-fold, stage 2):\n{pl.DataFrame(rows, strict=False)}")
 
 
 def feat_files(split):
@@ -173,6 +230,12 @@ def stage2(log):
     cols = feature_columns(df)
     log(f"stage2 train pairs {len(df):,}  features {len(cols)}")
     oof = fit_kfold(df, cols, "lgb2", log)
+    trim_report(df, oof, log)
+    if CAND_TOP_N or CAND_MIN_P1:
+        m = trim_mask(df)
+        log(f"candidate trimming ON: top {CAND_TOP_N or 'all'}, p1 >= {CAND_MIN_P1} "
+            f"-> {m.mean():.1%} of pairs kept")
+        df, oof = df.filter(pl.Series(m)), oof[m]
     best = evaluate(df, oof, log, "stage2")
     best["features"] = cols
     model_path("decision.json").write_text(json.dumps(best, indent=1))
@@ -186,6 +249,8 @@ def predict(log):
     preds = []
     for f in feat_files("test"):
         df = pl.read_parquet(f).join(extra, on=["s1_id", "rec_id"], how="left")
+        if CAND_TOP_N or CAND_MIN_P1:
+            df = df.filter(pl.Series(trim_mask(df)))
         p = np.mean([b.predict(to_matrix(df, cols), num_threads=THREADS) for b in bs], axis=0)
         preds.append(df.select("s1_id", "rec_id").with_columns(p=pl.Series(p.astype(np.float32))))
         log(f"scored {f.name}: {len(df):,} pairs")
