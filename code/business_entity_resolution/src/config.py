@@ -202,9 +202,10 @@ PRUNER_PARAMS = {
 # is off for the whole run.
 USE_CROSSENC = True
 CROSSENC_MODEL_NAME = "intfloat/multilingual-e5-small"  # MIT, 118M params (MODELS.md)
-CROSSENC_TRAIN_FRAC = 0.2         # share of training S1 reserved to fine-tune it
-CROSSENC_MAX_TRAIN_PAIRS = 400_000
-CROSSENC_EPOCHS = 2
+CROSSENC_TRAIN_FRAC = 0.35        # share of training S1 reserved to fine-tune it
+                                  # (100k validate: 0.2 / 2 epochs 0.9708 → 0.35 / 3 epochs 0.9724)
+CROSSENC_MAX_TRAIN_PAIRS = 300_000  # caps test-mode fine-tuning time (~30 min on T4 x2)
+CROSSENC_EPOCHS = 3
 CROSSENC_LR = 3e-5
 CROSSENC_TRAIN_BATCH = 64
 CROSSENC_MAX_LENGTH = 80          # tokens for both "name | address" texts together
@@ -325,7 +326,7 @@ TOP1_THRESHOLD = False
 # that maximise expected F0.5, k may be 0) on the out-of-fold scores, for each
 # `miss` (expected true matches outside the candidates per S1); it replaces the
 # threshold only when its OOF macro F0.5 is higher. Not yet measured.
-EXPECTED_F_DECISION = True
+EXPECTED_F_DECISION = False  # 100k validate: 0.9707 vs 0.9708 with the threshold → off
 EXPECTED_F_MISS_GRID = (0.0, 0.1, 0.25, 0.5)
 EXPECTED_F_P_FLOOR = 0.02
 
