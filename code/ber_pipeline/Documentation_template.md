@@ -30,7 +30,8 @@ Key ideas:
   19% of training entities are removed (keeping their records) to reproduce the larger share of
   records without a true match.
 
-**Result:** macro F0.5 **0.9868** out of fold under test-like conditions (Section 5).
+**Result:** macro F0.5 **0.9868** out of fold under test-like conditions; **0.984 on the public
+leaderboard** (Section 5).
 
 ---
 
@@ -248,7 +249,7 @@ log-loss 0.0024). Decision: one-owner assignment + expected-F0.5 top-k selection
 | v2: + transliteration in blocking, name uniqueness, stage 2 | all entities | 0.964 | 0.988 | 0.9785 | 0.971 |
 | v3: + reverse search, larger K, test-like training (19% removed), 50% fit | 19% removed | 0.979 | 0.993 | 0.9823 (stage 1: 0.9807) | 0.9781 |
 | v4: + cross-encoder, name-only reverse search, skeleton transliteration, initials features | 19% removed | 0.981 | 0.994 | 0.9865 (stage 1: 0.9811) | 0.983 |
-| **v5: + typo-tolerant `comb4` view, word-substitution features, e5-base cross-encoder** | 19% removed | **0.982** | **0.994** | **0.9868** (stage 1: 0.9815) | [fill] |
+| **v5: + typo-tolerant `comb4` view, word-substitution features, e5-base cross-encoder** | 19% removed | **0.982** | **0.994** | **0.9868** (stage 1: 0.9815) | **0.984** |
 
 v2's validation did not contain test's larger share of records without an entity, which is why it
 over-estimated the leaderboard; from v3 on, validation uses test-like conditions and tracks the
@@ -295,7 +296,7 @@ Careful normalisation plus IDF-weighted word-pair blocking (forward and reverse,
 character-level) over transliteration-corrected names recovers 98.2% of true pairs at ~71 candidates
 per entity. A two-stage gradient-boosted classifier with competition and cluster-support features, a
 fine-tuned multilingual cross-encoder for uncertain pairs and a one-owner constraint reaches 0.9868
-macro F0.5 out of fold under test-like conditions. The biggest levers were data-driven undoing of the
+macro F0.5 out of fold under test-like conditions (0.984 on the public leaderboard). The biggest levers were data-driven undoing of the
 noise (transliteration table, legal / filler handling), exploiting the one-record-one-owner structure,
 and matching the training conditions to the test set's share of records without an entity.
 
