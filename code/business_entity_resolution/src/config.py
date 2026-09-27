@@ -112,12 +112,14 @@ SNAP_TO_REFERENCE = True
 # ──────────────────────────────────────────────────────────────────────
 
 # Hashed TF-IDF over word 1-2 grams, per source, searched per country:
-#   "name":     name_core
+#   "name":     name_core, words sorted alphabetically (word-order swaps)
 #   "combined": name_norm + address_norm
 #   "address":  address_norm only (finds records whose name is garbled but
-#               whose house number + street match; 0 = off)
+#               whose house number + street match; 0 = off). Slice test-like
+#               run: F0.5 0.9673 → 0.9682, stage-1 recall 0.9810 → 0.9827,
+#               same final candidates per S1 (the pruner caps them).
 # Top-K per blocker per source per S1 entity.
-BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 0}
+BLOCKING_TOP_K = {"name": 10, "combined": 10, "address": 10}
 BLOCKING_TOP_K_EMBEDDING = 10
 
 # Terms (words or word pairs) found in more than this many S2/S3 records of
@@ -162,6 +164,12 @@ PRUNE_MIN_PROB = 0.03     # ...and only those with pruner probability ≥ this
 PRUNE_SWEEP = True
 PRUNE_SWEEP_TOP_N = (6, 7, 8)
 PRUNE_SWEEP_MIN_PROB = (0.03, 0.05, 0.1)
+PRUNE_PREDICT_CHUNK = 5_000_000  # test: pairs per slice of pruner features + scores
+
+# --mode test: after training, restart as a fresh process for the test half
+# (os.execv, same PID and log), so the test split does not sit on top of the
+# memory training left behind. False = keep both halves in one process.
+TEST_FRESH_PROCESS = True
 PRUNE_FOLDS = 2           # out-of-fold pruning on train (by S1 entity)
 PRUNE_ROUNDS = 200        # boosting rounds for the pruner
 PRUNE_MAX_TRAIN_PAIRS = 20_000_000  # subsample S1 entities above this
@@ -183,6 +191,26 @@ PRUNER_PARAMS = {
 # Embeddings (optional: needs sentence-transformers + model download,
 # a GPU is recommended — use on Kaggle)
 # ──────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────
+# Optional transformer cross-encoder (crossenc.py)
+# ──────────────────────────────────────────────────────────────────────
+
+# Fine-tune a small multilingual transformer on the reserved share of training
+# S1 entities and add its match probability (plus its rank / gap within each
+# S1's candidates) to the stage-3 features. Needs a CUDA GPU; without one it
+# is off for the whole run.
+USE_CROSSENC = True
+CROSSENC_MODEL_NAME = "intfloat/multilingual-e5-small"  # MIT, 118M params (MODELS.md)
+CROSSENC_TRAIN_FRAC = 0.2         # share of training S1 reserved to fine-tune it
+CROSSENC_MAX_TRAIN_PAIRS = 400_000
+CROSSENC_EPOCHS = 2
+CROSSENC_LR = 3e-5
+CROSSENC_TRAIN_BATCH = 64
+CROSSENC_MAX_LENGTH = 80          # tokens for both "name | address" texts together
+CROSSENC_SCORE_BATCH = 512
+CROSSENC_SCORE_CHUNK = 1_000_000  # pairs whose texts are built at once when scoring
+CROSSENC_ALLOW_CPU = False        # tests on tiny data only
 
 # When True: an extra embedding kNN blocker (BLOCKING_TOP_K_EMBEDDING per
 # source) and embedding-cosine pair features.
@@ -206,13 +234,20 @@ FEATURE_GROUPS = {
     "tfidf": True,      # blocking TF-IDF cosines (name, name+address) + their ranks
     "numbers": True,    # overlap of all numbers in the address
     "structure": True,  # postal code / house number / country / lengths / missing / source
-    "rank": True,       # rank + gap to best within the S1's candidates and the
-                        # candidate's S1s, mutual best, candidate counts
+    "rank": True,       # rank + gap to best within the S1's candidates, candidate count
+    # Rank / gap among the S1s that share a candidate, mutual best, S1s per
+    # candidate. Their values depend on how many S1 records are loaded (test
+    # scores all test S1, training uses a --train-sample-s1 sample). Measured
+    # like test on an Iowa+Rajasthan slice (train on 15% of S1, score the rest
+    # with all S1 loaded): they hurt the unregularized LightGBM (0.9655 on vs
+    # 0.9679 off) but help the current one (lambda_l2=1): 0.9684 on vs 0.9673 off.
+    "cand_context": True,
     "blockers": True,   # which blockers produced the pair
     "pruner": True,     # stage-2 pruner probability
     "embedding": True,  # embedding cosine (only when USE_EMBEDDINGS)
     # Ideas from the record-linkage literature (Fellegi-Sunter, Ditto/DeepMatcher
-    # feature lists), not yet measured on a real validate:
+    # feature lists). 100k validate on lavya 7588b67 + these three groups:
+    # holdout F0.5 0.9559 → 0.9633 (precision 0.983), same candidates.
     "frequency": True,  # how many S1 / S2+S3 records share the name / address
                         # (whole split, before S1 sampling)
     "cross": True,      # name × address product / min / max, exact flags,

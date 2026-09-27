@@ -1,4 +1,5 @@
-# Optional: only for --embeddings / config.USE_EMBEDDINGS (GPU recommended).
+# Optional: for the cross-encoder (config.USE_CROSSENC, needs transformers + torch + a GPU)
+# and --embeddings / config.USE_EMBEDDINGS (sentence-transformers).
 # Model: intfloat/multilingual-e5-small (MIT, 118M) — see MODELS.md
 -r requirements.txt
 sentence-transformers==3.3.1

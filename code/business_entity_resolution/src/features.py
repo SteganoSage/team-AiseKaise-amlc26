@@ -414,6 +414,10 @@ def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
     - mutual best: best candidate for its S1 AND best S1 for its candidate
     Plus how many candidates the S1 has and how many S1s the candidate has.
 
+    The candidate-side features (second and third bullet, S1s per candidate)
+    depend on how many S1 records are loaded, so they are only built when
+    config.FEATURE_GROUPS["cand_context"] is on (see config.py).
+
     Args:
         s1_idx: S1 row per pair.
         tgt_idx: Target row per pair.
@@ -422,18 +426,21 @@ def rank_features(s1_idx: np.ndarray, tgt_idx: np.ndarray, sims: dict) -> dict:
     Returns:
         Dict of feature name → array.
     """
+    cand_context = config.FEATURE_GROUPS.get("cand_context", True)
     out = {}
     for key, values in sims.items():
         rank_s1 = group_rank(s1_idx, values)
-        rank_cand = group_rank(tgt_idx, values)
         out[f"rank_{key}_in_s1"] = rank_s1.astype(np.float32)
         out[f"gap_{key}_to_s1_best"] = group_max(s1_idx, values) - values
-        out[f"rank_{key}_in_cand"] = rank_cand.astype(np.float32)
-        out[f"gap_{key}_to_cand_best"] = group_max(tgt_idx, values) - values
-        out[f"mutual_best_{key}"] = ((rank_s1 == 1) & (rank_cand == 1)).astype(np.float32)
+        if cand_context:
+            rank_cand = group_rank(tgt_idx, values)
+            out[f"rank_{key}_in_cand"] = rank_cand.astype(np.float32)
+            out[f"gap_{key}_to_cand_best"] = group_max(tgt_idx, values) - values
+            out[f"mutual_best_{key}"] = ((rank_s1 == 1) & (rank_cand == 1)).astype(np.float32)
     out["n_cands_for_s1"] = np.bincount(s1_idx)[s1_idx].astype(np.float32)
-    _, inverse, counts = np.unique(tgt_idx, return_inverse=True, return_counts=True)
-    out["n_s1_for_cand"] = counts[inverse].astype(np.float32)
+    if cand_context:
+        _, inverse, counts = np.unique(tgt_idx, return_inverse=True, return_counts=True)
+        out["n_s1_for_cand"] = counts[inverse].astype(np.float32)
     return out
 
 
@@ -510,7 +517,8 @@ def sibling_features(tgt: pd.DataFrame, s1_idx: np.ndarray, tgt_idx: np.ndarray,
 
 
 def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFrame,
-                         embeddings: dict = None, verbose: bool = True) -> tuple:
+                         embeddings: dict = None, verbose: bool = True,
+                         extra: dict = None) -> tuple:
     """
     Build the stage-3 feature matrix for the pruned candidate pairs.
 
@@ -525,6 +533,9 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
         embeddings: Optional {"s1": {"name", "full"}, "tgt": {"name", "full"}}
             embedding arrays aligned with the frames.
         verbose: Whether to print progress.
+        extra: Optional {feature name: array aligned with pairs} computed
+            elsewhere (e.g. "crossenc_prob" from crossenc.py). A
+            "crossenc_prob" also gets rank / gap features like the other scores.
 
     Returns:
         Tuple (X float32 matrix, feature names).
@@ -539,8 +550,10 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
     for start in range(0, len(pairs), step):
         end = start + step
         chunks.append(chunk_features(s1, tgt, s1_idx[start:end], tgt_idx[start:end]))
-    cols = {name: np.concatenate([c[name] for c in chunks]).astype(np.float32)
-            for name in (chunks[0] if chunks else {})}
+    cols = {}
+    for name in list(chunks[0]) if chunks else []:
+        cols[name] = np.concatenate([c.pop(name) for c in chunks]).astype(np.float32, copy=False)
+    del chunks
 
     if groups.get("cross", True):
         cols.update(cross_features(cols))
@@ -570,7 +583,12 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
                 "combined": pairs["score_combined"].to_numpy(dtype=np.float32)}
         if "pruner_prob" in pairs:
             sims["pruner"] = pairs["pruner_prob"].to_numpy(dtype=np.float32)
+        if extra and "crossenc_prob" in extra:
+            sims["crossenc"] = np.asarray(extra["crossenc_prob"], dtype=np.float32)
         cols.update(rank_features(s1_idx, tgt_idx, sims))
+
+    for name, values in (extra or {}).items():
+        cols[name] = np.asarray(values, dtype=np.float32)
 
     if groups.get("sibling", False) and "pruner_prob" in pairs:
         t0 = time.time()
@@ -586,9 +604,12 @@ def build_feature_matrix(pairs: pd.DataFrame, s1: pd.DataFrame, tgt: pd.DataFram
         if "score_embedding" in pairs:
             cols["blk_rank_embedding"] = pairs["rank_embedding"].to_numpy(dtype=np.float32)
 
+    # Fill the matrix one column at a time, freeing each column as it is copied,
+    # so the columns and the matrix (~8.6M test pairs x 91) are not both held
     names = list(cols)
-    X = np.column_stack([cols[n] for n in names]).astype(np.float32, copy=False) \
-        if len(pairs) else np.empty((0, len(names)), dtype=np.float32)
+    X = np.empty((len(pairs), len(names)), dtype=np.float32)
+    for j, name in enumerate(names):
+        X[:, j] = cols.pop(name)
     if verbose:
         print(f"  Stage-3 features: {len(pairs):,} pairs × {len(names)}")
     return X, names

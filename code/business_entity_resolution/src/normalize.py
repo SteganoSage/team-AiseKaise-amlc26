@@ -572,9 +572,76 @@ def normalize_address(address: str) -> str:
         Normalized business address.
     """
     text = normalize_text(NUMERO_RE.sub(" ", HALF_RE.sub(" ", address)))
+    text = expand_abbreviations(PMB_RE.sub(" ", text), ORDINAL_WORDS)
+    text = canonical_numbers(text)
+    # Before the abbreviations, so "Florida" and "FL" both end up as the same word
+    text = REGION_RE.sub(lambda m: REGION_CODES[m.group(0)], text)
     text = expand_abbreviations(text, ADDRESS_ABBREVIATIONS)
-    text = expand_abbreviations(text, ORDINAL_WORDS)
     return _drop_repeats(" ".join(t for t in text.split() if t not in NULL_TOKENS))
+
+
+def canonical_numbers(text: str) -> str:
+    """
+    Write every number of a normalized address the same way on both sides.
+
+    "00537 par drive" → "537 par drive", "1415a jefferson" → "1415 a jefferson",
+    "67st avenue" / "67th avenue" → "67 avenue" (S2/S3 pad house numbers with
+    zeros, glue unit letters and randomise the ordinal suffix). A single
+    leading zero is kept: ZIP / French postcodes start with one ("02134", "01000").
+
+    Args:
+        text: Normalized address.
+
+    Returns:
+        The address with canonical numbers.
+    """
+    text = LEADING_ZEROS_RE.sub("", text)
+    text = ORDINAL_SUFFIX_RE.sub(r"\1", text)
+    return NUMBER_LETTER_RE.sub(r"\1 \2", text)
+
+
+# Number spellings (see canonical_numbers)
+LEADING_ZEROS_RE = re.compile(r"\b00+(?=\d)")
+ORDINAL_SUFFIX_RE = re.compile(r"\b(\d+)(?:st|nd|rd|th|er|eme)\b")
+NUMBER_LETTER_RE = re.compile(r"\b(\d+)([a-z])\b")
+
+# "PMB 6868" (private mailbox): added to S2/S3 addresses only, pure noise
+PMB_RE = re.compile(r"\bpmb\s+\d+\b")
+
+# State / region names → one code, so "Iowa" = "IA" and "Tamil Nadu" = "TN"
+# (S1 and S2/S3 use either form), plus old/new names of big Indian cities.
+# Hand-written, generic: an unseen country's regions are simply left as they are.
+REGION_CODES = {
+    # US states
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
+    "colorado": "co", "connecticut": "ct", "delaware": "de", "district of columbia": "dc",
+    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id", "illinois": "il",
+    "indiana": "in", "iowa": "ia", "kansas": "ks", "kentucky": "ky", "louisiana": "la",
+    "maine": "me", "maryland": "md", "massachusetts": "ma", "michigan": "mi",
+    "minnesota": "mn", "mississippi": "ms", "missouri": "mo", "montana": "mt",
+    "nebraska": "ne", "nevada": "nv", "new hampshire": "nh", "new jersey": "nj",
+    "new mexico": "nm", "new york": "ny", "north carolina": "nc", "north dakota": "nd",
+    "ohio": "oh", "oklahoma": "ok", "oregon": "or", "pennsylvania": "pa",
+    "rhode island": "ri", "south carolina": "sc", "south dakota": "sd", "tennessee": "tn",
+    "texas": "tx", "utah": "ut", "vermont": "vt", "virginia": "va", "washington": "wa",
+    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy", "puerto rico": "pr",
+    # Indian states / union territories (codes used in S2/S3 addresses)
+    "andhra pradesh": "ap", "arunachal pradesh": "ar", "assam": "as", "bihar": "br",
+    "chhattisgarh": "cg", "goa": "ga", "gujarat": "gj", "haryana": "hr",
+    "himachal pradesh": "hp", "jharkhand": "jh", "karnataka": "ka", "kerala": "kl",
+    "madhya pradesh": "mp", "maharashtra": "mh", "manipur": "mn", "meghalaya": "ml",
+    "mizoram": "mz", "nagaland": "nl", "odisha": "od", "orissa": "od", "punjab": "pb",
+    "rajasthan": "rj", "sikkim": "sk", "tamil nadu": "tn", "telangana": "tg",
+    "tripura": "tr", "uttar pradesh": "up", "uttarakhand": "uk", "uttaranchal": "uk",
+    "west bengal": "wb", "jammu and kashmir": "jk", "chandigarh": "ch",
+    "puducherry": "py", "pondicherry": "py",
+    # Old and new names of the same Indian city
+    "bombay": "mumbai", "calcutta": "kolkata", "madras": "chennai",
+    "bengaluru": "bangalore", "gurugram": "gurgaon", "poona": "pune",
+    "baroda": "vadodara", "trivandrum": "thiruvananthapuram",
+}
+REGION_RE = re.compile(r"\b(?:" + "|".join(
+    re.escape(name) for name in sorted(REGION_CODES, key=len, reverse=True)) + r")\b")
 
 
 # "N°23", "Nº 257" (numéro): otherwise "n" becomes "north" and "nº" becomes "no"

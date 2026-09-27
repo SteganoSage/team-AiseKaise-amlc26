@@ -4,7 +4,9 @@ Stage 1 — blocking (candidate generation), built for ~2M S1 x ~5M S2/S3.
 Determines the recall ceiling of the pipeline. For each S1 record and each
 source (S2, S3) separately, inside the same country:
 
-1. "name" blocker:     TF-IDF on word 1-2 grams of name_core → top-K
+1. "name" blocker:     TF-IDF on word 1-2 grams of name_core, words sorted
+   alphabetically (so "store link company" still shares its word pairs with
+   "link store company" once the common single words are dropped) → top-K
 2. "combined" blocker: TF-IDF on word 1-2 grams of name + address → top-K
 3. (optional) "address" blocker: TF-IDF on word 1-2 grams of the address only,
    so a record whose name is garbled (typos, other script, website form) is
@@ -62,7 +64,8 @@ def blocker_texts(frame: pd.DataFrame, blocker: str) -> list:
         List of strings, one per record.
     """
     if blocker == "name":
-        return frame["name_core"].tolist()
+        # Word order is noise in names ("Hospital Animal Ridge"): sort the words
+        return [" ".join(sorted(name.split())) for name in frame["name_core"].tolist()]
     if blocker == "combined":
         return (frame["name_norm"] + " " + frame["address_norm"]).tolist()
     if blocker == "address":
@@ -467,7 +470,9 @@ def generate_candidates(s1: pd.DataFrame, tgt: pd.DataFrame,
         parts.append(part)
 
     pairs = pd.concat(parts, ignore_index=True)
-    return pairs.sort_values(["s1_idx", "tgt_idx"], kind="stable").reset_index(drop=True)
+    del parts  # free the per-source frames before sorting (tens of millions of pairs)
+    order = np.lexsort((pairs["tgt_idx"].to_numpy(), pairs["s1_idx"].to_numpy()))
+    return pairs.take(order).reset_index(drop=True)
 
 
 # ──────────────────────────────────────────────────────────────────────
