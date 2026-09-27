@@ -321,6 +321,14 @@ PER_SOURCE_THRESHOLD = False
 # precision/recall a little, so the best cutoffs usually differ.
 TOP1_THRESHOLD = False
 
+# Also try a per-S1 expected-F0.5 selection (keep the top-k pairs of each S1
+# that maximise expected F0.5, k may be 0) on the out-of-fold scores, for each
+# `miss` (expected true matches outside the candidates per S1); it replaces the
+# threshold only when its OOF macro F0.5 is higher. Not yet measured.
+EXPECTED_F_DECISION = True
+EXPECTED_F_MISS_GRID = (0.0, 0.1, 0.25, 0.5)
+EXPECTED_F_P_FLOOR = 0.02
+
 # ──────────────────────────────────────────────────────────────────────
 # Diagnostics
 # ──────────────────────────────────────────────────────────────────────

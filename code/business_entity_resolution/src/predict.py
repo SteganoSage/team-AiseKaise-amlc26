@@ -51,9 +51,57 @@ def format_threshold(threshold) -> str:
     Returns:
         Formatted string.
     """
+    if isinstance(threshold, dict) and threshold.get("method") == "expected_f":
+        return f"expected-F0.5 per S1 (miss {threshold['miss']:g})"
     if isinstance(threshold, dict):
         return " / ".join(f"{src} {t:.3f}" for src, t in sorted(threshold.items()))
     return f"{threshold:.3f}"
+
+
+def select_expected_f(scores: np.ndarray, s1_idx: np.ndarray, rows: np.ndarray,
+                      miss: float, p_floor: float = None) -> np.ndarray:
+    """
+    Per S1, keep the top-k pairs that maximise the expected F0.5 (k may be 0).
+
+    With the S1's pairs sorted by probability p (only p ≥ p_floor count),
+    E[F0.5 | keep top k] ≈ 1.25 · Σ_{i≤k} p_i / (0.25 · (Σ_all p + miss) + k)
+    and E[F0.5 | keep none] = Π (1 − p_i) (the S1 is a singleton only if every
+    candidate is wrong). `miss` is the expected number of true matches the
+    candidate set does not contain. The top-k are kept only when their
+    expected F0.5 beats keeping none.
+
+    Args:
+        scores: Match probability per pair.
+        s1_idx: S1 row per pair.
+        rows: Pair indices to choose from (e.g. after conflict resolution).
+        miss: Expected true matches outside the candidates, per S1.
+        p_floor: Ignore pairs below this probability (config.EXPECTED_F_P_FLOOR).
+
+    Returns:
+        Sorted indices (subset of rows) of the pairs kept.
+    """
+    if p_floor is None:
+        p_floor = config.EXPECTED_F_P_FLOOR
+    rows = rows[scores[rows] >= p_floor]
+    if not len(rows):
+        return rows
+    order = rows[np.lexsort((-scores[rows], s1_idx[rows]))]      # by S1, then p desc
+    p, g = scores[order].astype(np.float64), s1_idx[order]
+    starts = np.r_[0, np.flatnonzero(g[1:] != g[:-1]) + 1]
+    group = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(g)]))
+    k = np.arange(len(g)) - starts[group] + 1
+    csum = np.cumsum(p)
+    cs = csum - np.r_[0.0, csum][starts][group]                  # cumulative p within S1
+    total = np.add.reduceat(p, starts)[group]
+    ef = 1.25 * cs / (0.25 * (total + miss) + k)
+    ef0 = np.exp(np.add.reduceat(np.log(np.clip(1 - p, 1e-9, 1)), starts))
+    best = np.maximum.reduceat(ef, starts)
+    # smallest k reaching the group's best expected F0.5
+    is_best = ef >= best[group] - 1e-12
+    kbest = np.full(len(starts), np.iinfo(np.int64).max)
+    np.minimum.at(kbest, group[is_best], k[is_best])
+    keep = (best[group] > ef0[group]) & (k <= kbest[group])
+    return np.sort(order[keep])
 
 
 def pair_thresholds(is_s2: np.ndarray, threshold, is_top1: np.ndarray = None):
@@ -106,6 +154,14 @@ def decide(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
         resolve_conflicts = config.RESOLVE_CONFLICTS
     if max_per_s1 is None:
         max_per_s1 = config.MAX_MATCHES_PER_S1
+
+    if isinstance(threshold, dict) and threshold.get("method") == "expected_f":
+        keep = np.flatnonzero(scores >= config.EXPECTED_F_P_FLOOR)
+        if resolve_conflicts and len(keep):
+            order = keep[np.argsort(-scores[keep], kind="stable")]
+            _, first = np.unique(tgt_idx[order], return_index=True)
+            keep = order[first]  # best-scoring S1 for each target
+        return select_expected_f(scores, s1_idx, keep, threshold["miss"])
 
     is_top1 = None
     if isinstance(threshold, dict) and "top1" in threshold:
@@ -227,5 +283,19 @@ def tune_threshold(scores: np.ndarray, s1_idx: np.ndarray, tgt_idx: np.ndarray,
         if verbose:
             print(f"  → With top-1 threshold: {format_threshold(best)} "
                   f"(F0.5 = {best_f05:.4f})")
+
+    if config.EXPECTED_F_DECISION:
+        # Per-S1 expected-F0.5 selection instead of a cutoff; kept only if its
+        # out-of-fold macro F0.5 beats the tuned threshold(s) above
+        for miss in config.EXPECTED_F_MISS_GRID:
+            rule = {"method": "expected_f", "miss": float(miss)}
+            keep = decide(scores, s1_idx, tgt_idx, is_s2, rule)
+            f05, p, r = evaluate_decision(keep, s1_idx, labels, n_true_by_row, universe)
+            if verbose:
+                print(f"  {format_threshold(rule):>40s}  F0.5 {f05:.4f}  P {p:.4f}  R {r:.4f}")
+            if f05 > best_f05:
+                best_threshold, best_f05 = rule, f05
+        if verbose:
+            print(f"  → Decision rule: {format_threshold(best_threshold)} (F0.5 = {best_f05:.4f})")
 
     return best_threshold, best_f05
