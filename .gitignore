@@ -48,3 +48,4 @@ dataset_fake/
 # Uploaded submission files: ~100-180 MB each, over GitHub's 100 MB limit.
 # Keep them in the Kaggle version output; commit only run_info.json + the LOG.md row.
 submissions/*/*.tsv
+work/

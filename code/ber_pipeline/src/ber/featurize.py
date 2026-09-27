@@ -15,11 +15,9 @@ import polars as pl
 from . import translit
 from .config import stage_dir, work
 from .features import add_record_extras, add_s1_extras, pair_features, word_idf
-from .io import load_norm_s1
+from .io import load_norm_s1, s1_subset
 
 CHUNK_S1 = 150_000
-
-
 STATE_BLANK_FRAC = 0.15
 
 
@@ -38,15 +36,8 @@ def blank_state(feats, frac=STATE_BLANK_FRAC):
     )
 
 
-def s1_subset(ids, frac, seed=17):
-    """Deterministic hash-based subset of S1 ids (same on every run/machine)."""
-    if frac >= 1:
-        return ids
-    h = ids.hash(seed=seed) % 1_000_000
-    return ids.filter(h < int(frac * 1_000_000))
-
-
 def main():
+    """Command line: pair features for every candidate table of one split, in S1 chunks."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["train", "test"], required=True)
     ap.add_argument("--frac", type=float, default=1.0, help="share of S1 entities (train)")

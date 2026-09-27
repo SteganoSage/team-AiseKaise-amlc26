@@ -8,6 +8,7 @@ SOURCE_COLS = ["entity_id", "business_name", "business_address", "country"]
 
 def _read_tsv(path):
     # quote_char=None: names contain stray quotes; every column is read as text.
+    """Read a challenge TSV with every column as text (no quoting, empty strings kept)."""
     return pl.read_csv(
         path, separator="\t", quote_char=None, infer_schema=False,
         missing_utf8_is_empty_string=True,
@@ -80,3 +81,11 @@ def load_gt_pairs():
         )
         pairs.write_parquet(cache)
     return pl.read_parquet(cache)
+
+
+def s1_subset(ids, frac, seed=17):
+    """Deterministic hash-based subset of S1 ids (same on every run/machine)."""
+    if frac >= 1:
+        return ids
+    h = ids.hash(seed=seed) % 1_000_000
+    return ids.filter(h < int(frac * 1_000_000))

@@ -29,8 +29,7 @@ import polars as pl
 from .config import THREADS, stage_dir, work
 from .decide import decide
 from .features import feature_columns
-from .featurize import s1_subset
-from .io import in_ce_pool, load_gt_pairs
+from .io import in_ce_pool, load_gt_pairs, s1_subset
 from .metrics import blocking_report, f05_macro
 
 PARAMS = dict(
@@ -40,7 +39,9 @@ PARAMS = dict(
 )
 N_FOLDS = 3
 MAX_ROUNDS = 4000
-TRAIN_FRAC = float(os.environ.get("BER_TRAIN_FRAC", 0.6))  # share of (kept, non-cross-encoder) training S1 entities the LightGBMs are fitted on (memory: ~50M rows)
+# Share of (kept, non-cross-encoder) training S1 entities the LightGBMs are
+# fitted on (memory: ~50M rows at 0.6). Override with BER_TRAIN_FRAC.
+TRAIN_FRAC = float(os.environ.get("BER_TRAIN_FRAC", 0.6))
 TAG = ""  # dev runs set this from --tag; selects feat_<tag>/ and models_<tag>/
 
 # Optional trimming of the final candidate set (candidate_pairs.tsv size counts
@@ -101,18 +102,22 @@ def trim_report(df, oof, log):
 
 
 def feat_files(split):
+    """Feature parquet files of a split, sorted."""
     return sorted(work(stage_dir("feat", TAG), "x").parent.glob(f"{split}_*.parquet"))
 
 
 def model_path(name):
+    """Path of a model artefact under WORK_DIR/models[_<tag>]."""
     return work(stage_dir("models", TAG), name)
 
 
 def to_matrix(df, cols):
+    """float32 numpy matrix of the given feature columns."""
     return df.select([pl.col(c).cast(pl.Float32) for c in cols]).to_numpy()
 
 
 def fold_of(ids, n=N_FOLDS):
+    """Deterministic fold number (0..n-1) of each S1 id, by hash."""
     return (ids.hash(seed=3) % n).cast(pl.Int8)
 
 
@@ -154,6 +159,7 @@ def fit_kfold(df, cols, prefix, log):
 
 
 def boosters(prefix):
+    """Load the saved fold models of a stage ("lgb1" or "lgb2")."""
     return [lgb.Booster(model_file=str(model_path(f"{prefix}_fold{k}.txt"))) for k in range(N_FOLDS)]
 
 
@@ -174,6 +180,17 @@ def tune(oof, truth, ids, log):
 
 
 def evaluate(df, oof, log, name):
+    """Save out-of-fold predictions and pick the best decision rule on them.
+
+    Args:
+        df: Training pairs (s1_id, rec_id, label, ...).
+        oof: Out-of-fold probabilities aligned with df.
+        log: Progress printer.
+        name: "stage1" or "stage2" (file name of the saved predictions).
+
+    Returns:
+        Dict describing the best rule (method, t or miss, f05).
+    """
     ids = df["s1_id"].unique()
     truth = load_gt_pairs().join(ids.to_frame(), on="s1_id")
     pred = df.select("s1_id", "rec_id").with_columns(p=pl.Series(oof))
@@ -209,6 +226,7 @@ def predict_p1(split, cols, log):
 
 
 def stage1(log):
+    """Fit the first-stage fold models and write p1 for every train and test pair."""
     df = load_train()
     cols = feature_columns(df)
     ids = df["s1_id"].unique()
@@ -225,6 +243,7 @@ def stage1(log):
 
 
 def stage2(log):
+    """Fit the second-stage fold models, report trimming options, save the decision rule."""
     extra = pl.read_parquet(model_path("stage2_train.parquet"))
     df = load_train(extra)
     cols = feature_columns(df)
@@ -242,6 +261,7 @@ def stage2(log):
 
 
 def predict(log):
+    """Score the test pairs with the second-stage models and write both submission files."""
     cfg = json.loads(model_path("decision.json").read_text())
     cols = cfg["features"]
     extra = pl.read_parquet(model_path("stage2_test.parquet"))
@@ -263,6 +283,7 @@ def predict(log):
 
 
 def main():
+    """Command line: `stage1`, `stage2` or `predict`."""
     global TAG, TRAIN_FRAC
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["stage1", "stage2", "predict"])

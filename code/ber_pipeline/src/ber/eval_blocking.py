@@ -18,6 +18,7 @@ from .metrics import blocking_report
 
 
 def main():
+    """Command line: blocking recall report on a sample of training S1 entities."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--frac", type=float, default=0.1)
     ap.add_argument("--k", type=int, default=30)

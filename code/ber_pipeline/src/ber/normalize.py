@@ -91,6 +91,7 @@ _IN_EXTRA = {"ts": "tg", "ct": "cg", "or": "od", "ua": "uk", "orrisa": "od"}
 
 
 def _state_map(names, extra=()):
+    """{full state name or code -> code} lookup, plus extra aliases."""
     m = dict(names)
     m.update({code: code for code in names.values()})
     m.update(extra)
@@ -104,6 +105,7 @@ STATE_MAPS = {
 
 
 def to_ascii(s):
+    """Lower-case ASCII transliteration of any script (anyascii), after symbol fixes."""
     return anyascii(s.translate(_PRE)).lower()
 
 
@@ -134,6 +136,7 @@ def skeleton(tokens):
 
 
 def _unleet(tok):
+    """Undo digit-for-letter substitutions ("0rthopedic") in mostly-alphabetic tokens."""
     letters = sum(c.isalpha() for c in tok)
     if letters >= 3 and letters < len(tok):
         return tok.translate(_LEET)

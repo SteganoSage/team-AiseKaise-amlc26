@@ -1,6 +1,5 @@
-# ber pipeline (code/ber_pipeline/src). Versions below are the ones the pipeline
-# was smoke-tested with on fake data (26 Sep); torch/transformers only for the
-# cross-encoder step (GPU).
+# Python 3.10-3.12. torch/transformers are only needed for the cross-encoder
+# steps (CUDA GPU); run_all.py skips those steps when no GPU is available.
 polars==1.44.2
 sparse_dot_topn==1.2.0
 anyascii==0.3.3

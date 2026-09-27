@@ -20,10 +20,29 @@ def assign_one_owner(pred):
 
 
 def select_threshold(pred, t):
+    """Pairs with probability >= t.
+
+    Args:
+        pred: Pairs with s1_id, rec_id and probability p.
+        t: Threshold.
+
+    Returns:
+        DataFrame (s1_id, rec_id) of the kept pairs.
+    """
     return pred.filter(pl.col("p") >= t).select("s1_id", "rec_id")
 
 
 def select_expected_f(pred, miss=0.0, p_floor=0.02):
+    """Per S1 entity, keep the top-k pairs maximising the expected F0.5.
+
+    Args:
+        pred: Pairs with s1_id, rec_id and probability p.
+        miss: Expected true matches per entity that blocking did not retrieve.
+        p_floor: Pairs below this probability are ignored.
+
+    Returns:
+        DataFrame (s1_id, rec_id) of the kept pairs (k may be 0 for an entity).
+    """
     df = pred.filter(pl.col("p") >= p_floor).sort(["s1_id", "p"], descending=[False, True])
     df = df.with_columns(
         k=pl.col("p").cum_count().over("s1_id"),
@@ -38,6 +57,16 @@ def select_expected_f(pred, miss=0.0, p_floor=0.02):
 
 
 def decide(pred, method="threshold", **kw):
+    """Apply one-owner assignment, then the chosen per-S1 selection rule.
+
+    Args:
+        pred: Pairs with s1_id, rec_id and probability p.
+        method: "threshold" or "expected_f".
+        **kw: t (threshold) or miss / p_floor (expected_f).
+
+    Returns:
+        DataFrame (s1_id, rec_id) of the predicted matches.
+    """
     owned = assign_one_owner(pred)
     if method == "threshold":
         return select_threshold(owned, kw.get("t", 0.5))

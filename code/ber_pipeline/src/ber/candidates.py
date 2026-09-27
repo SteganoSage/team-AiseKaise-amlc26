@@ -15,12 +15,10 @@ import polars as pl
 
 from . import translit
 from .blocking import block_country
-from .translit import translate_expr
 from .config import stage_dir, work
-from .featurize import s1_subset
-from .io import load_norm_s1
 from .features import COS_COLS, add_context, add_exact_cosines
-from .io import load_gt_pairs
+from .io import load_gt_pairs, load_norm_s1, s1_subset
+from .translit import translate_expr
 
 # Top-K per view (every view at the cheap 5k frequency cap). 15/10/10 gave
 # 0.964 pair recall on training; the leaderboard leader scores above that
@@ -33,6 +31,20 @@ REVERSE_K = {"words2": (3, 0.0), "name4": (5, 0.3), "comb4": (3, 0.2)}
 
 
 def build_country(s1c, recc, views, k, gt=None, log=print, reverse=REVERSE_K):
+    """Candidate table of one country: blocking, exact cosines, context, labels.
+
+    Args:
+        s1c: Normalised Source 1 records of the country.
+        recc: Normalised Source 2+3 records of the country.
+        views: Blocking views to run (see ber.blocking.VIEWS).
+        k: Top-K per view, an int or {view: K}.
+        gt: Training ground-truth pairs (s1_id, rec_id), or None for test.
+        log: Progress printer.
+        reverse: Reverse-search settings {view: (K, min_cos)}, or None.
+
+    Returns:
+        polars DataFrame, one row per (s1_id, rec_id) candidate pair.
+    """
     cand = block_country(s1c, recc, views, k, log=log, reverse=reverse)
     cand = cand.with_columns(
         s1_id=s1c["entity_id"].gather(cand["s1_row"]),
@@ -48,6 +60,7 @@ def build_country(s1c, recc, views, k, gt=None, log=print, reverse=REVERSE_K):
 
 
 def main():
+    """Command line: build and save the candidate tables of one split, country by country."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["train", "test"], required=True)
     ap.add_argument("--countries", default="")

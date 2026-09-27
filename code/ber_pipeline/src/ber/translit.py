@@ -38,6 +38,7 @@ def learn(s1, rec, gt, min_count=20, min_purity=0.5):
 
 
 def load_or_learn(log=print):
+    """The learned transliteration table (cached in WORK_DIR/norm/translit_map.json)."""
     path = work("norm", "translit_map.json")
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))

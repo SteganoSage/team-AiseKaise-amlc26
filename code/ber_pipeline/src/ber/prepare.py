@@ -23,6 +23,7 @@ KEEP = ["entity_id", "country"]
 
 
 def _norm_chunk(args):
+    """Worker: normalise a chunk of (name, address, country) triples into a DataFrame."""
     names, addrs, countries, aliases = args
     out = {}
     for n, a, c in zip(names, addrs, countries):
@@ -34,6 +35,15 @@ def _norm_chunk(args):
 
 
 def normalize_frame(df, aliases):
+    """Normalise every record of a frame in parallel worker processes.
+
+    Args:
+        df: Raw records (entity_id, business_name, business_address, country[, source]).
+        aliases: {country: {address component -> state code}} learned from training.
+
+    Returns:
+        DataFrame with the id columns plus the normalised name/address columns.
+    """
     tasks = [
         (part["business_name"].to_list(), part["business_address"].to_list(),
          part["country"].to_list(), aliases)
@@ -79,6 +89,7 @@ def learn_state_aliases(s1_norm, recs, gt, min_count=20, min_purity=0.9):
 
 
 def main():
+    """Command line: normalise both splits and learn the state aliases."""
     t0 = time.time()
     log = lambda msg: print(f"[{time.time() - t0:6.0f}s] {msg}", flush=True)
     s1_path = work("norm", "train_s1.parquet")

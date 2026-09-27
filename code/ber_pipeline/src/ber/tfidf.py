@@ -20,6 +20,7 @@ _CHUNK = 200_000
 
 
 def _hash_chunk(args):
+    """Worker: raw hashed term counts of one chunk of texts."""
     texts, cfg = args
     hv = HashingVectorizer(n_features=N_FEATURES, alternate_sign=False, norm=None,
                            dtype=np.float32, lowercase=False, **cfg)

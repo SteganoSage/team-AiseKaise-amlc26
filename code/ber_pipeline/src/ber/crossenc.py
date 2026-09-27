@@ -49,6 +49,7 @@ def _amp_dtype():
 
 
 def model_dir():
+    """Folder where the fine-tuned cross-encoder is saved."""
     return work(stage_dir("models", TAG), "ce", "x").parent
 
 
@@ -65,16 +66,23 @@ def _texts(split):
 
 
 def _attach_text(pairs, texts):
+    """Join the raw texts of both sides onto (s1_id, rec_id) pairs as columns ta / tb."""
     return (pairs.join(texts.rename({"entity_id": "s1_id", "text": "ta"}), on="s1_id")
                  .join(texts.rename({"entity_id": "rec_id", "text": "tb"}), on="rec_id"))
 
 
 def _batches(n, size, order):
+    """Yield consecutive slices of `order` of length `size` (the last may be shorter)."""
     for i in range(0, n, size):
         yield order[i:i + size]
 
 
 def train(log):
+    """Fine-tune the cross-encoder on the reserved pool's uncertain pairs and save it.
+
+    Args:
+        log: Progress printer.
+    """
     p1 = pl.read_parquet(work(stage_dir("models", TAG), "p1_train.parquet"))
     pool = p1.filter(in_ce_pool(pl.col("s1_id")))
     band = pl.col("p1").is_between(LO * 0.2, 1 - (1 - HI) * 0.2)
@@ -128,6 +136,18 @@ def train(log):
 
 @torch.no_grad()
 def _predict(model, tok, ta, tb, batch=2048):
+    """Match probabilities for text pairs, batched by length (GPU).
+
+    Args:
+        model: Fine-tuned sequence-classification model.
+        tok: Its tokenizer.
+        ta: Left texts (Source 1).
+        tb: Right texts (Source 2/3).
+        batch: Pairs per forward pass.
+
+    Returns:
+        float32 numpy array of probabilities aligned with the inputs.
+    """
     model.eval()
     order = np.argsort([len(a) + len(b) for a, b in zip(ta, tb)])
     out = np.empty(len(ta), dtype=np.float32)
@@ -140,6 +160,14 @@ def _predict(model, tok, ta, tb, batch=2048):
 
 
 def score(log):
+    """Score the uncertain pairs of both splits with the saved cross-encoder.
+
+    Writes WORK_DIR/models/ce_{split}.parquet (s1_id, rec_id, ce). Training
+    pairs of the reserved pool are skipped (they are in-sample).
+
+    Args:
+        log: Progress printer.
+    """
     tok = AutoTokenizer.from_pretrained(model_dir())
     model = AutoModelForSequenceClassification.from_pretrained(model_dir()).cuda()
     for split in ("train", "test"):
@@ -158,6 +186,7 @@ def score(log):
 
 
 def main():
+    """Command line: `train` or `score`."""
     global TAG
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["train", "score"])

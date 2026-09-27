@@ -133,6 +133,15 @@ def attach(pairs, s1, rec):
 
 
 def _fuzzy(df, workers=-1):
+    """rapidfuzz similarities for every (column, scorer) of FUZZ_PLAN, computed in parallel.
+
+    Args:
+        df: Pairs with s1_<col> and r_<col> text columns (see attach).
+        workers: Threads for rapidfuzz (-1 = all cores).
+
+    Returns:
+        DataFrame with one float32 column per similarity, aligned with df.
+    """
     out = {}
     for col, scorers in FUZZ_PLAN.items():
         a, b = df[f"s1_{col}"].to_list(), df[f"r_{col}"].to_list()
@@ -143,10 +152,19 @@ def _fuzzy(df, workers=-1):
 
 
 def _tok(col):
+    """Polars expression: the column split into non-empty space-separated tokens."""
     return pl.col(col).str.split(" ").list.eval(pl.element().filter(pl.element() != ""))
 
 
 def _set_features(df):
+    """Token-set, number, state, legal-form, marker and flag features of each pair.
+
+    Args:
+        df: Pairs with both sides' normalised columns (see attach).
+
+    Returns:
+        DataFrame of features aligned with df.
+    """
     feats = []
     for col in ("n_core", "n_core_tr", "a_norm", "a_nums", "n_skel"):
         a, b = _tok(f"s1_{col}"), _tok(f"r_{col}")

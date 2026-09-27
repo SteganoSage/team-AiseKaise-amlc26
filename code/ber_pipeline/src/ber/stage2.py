@@ -34,6 +34,14 @@ CHUNK_S1 = 200_000
 
 
 def context(p):
+    """Record-competition and entity-context features of the first-stage probabilities.
+
+    Args:
+        p: Pairs with s1_id, rec_id and p1.
+
+    Returns:
+        DataFrame (s1_id, rec_id, p1, context columns).
+    """
     rec_top = p.group_by("rec_id").agg(
         p1_max_rec=pl.col("p1").max(),
         p1_2nd_rec=pl.col("p1").sort(descending=True).head(2).last(),
@@ -101,6 +109,13 @@ def cluster(p, names, log=print):
 
 
 def build(split, tag="", log=print):
+    """Write WORK_DIR/models/stage2_{split}.parquet: context, cluster support, cross-encoder score.
+
+    Args:
+        split: "train" or "test".
+        tag: Dev-run folder suffix.
+        log: Progress printer.
+    """
     models = stage_dir("models", tag)
     p = pl.read_parquet(work(models, f"p1_{split}.parquet"))
     names = (pl.read_parquet(work("norm", f"{split}_rec.parquet"),
@@ -129,6 +144,7 @@ def build(split, tag="", log=print):
 
 
 def main():
+    """Command line: second-stage inputs of one split."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["train", "test"], required=True)
     ap.add_argument("--tag", default="")
